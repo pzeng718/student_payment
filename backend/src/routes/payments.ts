@@ -12,7 +12,10 @@ const paymentValidation = [
   body('amount').isDecimal({ min: 0.01 }).withMessage('Amount must be greater than 0'),
   body('classes_purchased').isInt({ min: 1 }).withMessage('Classes purchased must be at least 1'),
   body('payment_reference').optional().trim().isLength({ min: 1, max: 100 }),
-  body('notes').optional().trim().isLength({ max: 1000 })
+  body('notes').optional().trim().isLength({ max: 1000 }),
+  body('class_allocations').optional().isArray().withMessage('Class allocations must be an array'),
+  body('class_allocations.*.class_id').optional().isUUID().withMessage('Valid class ID required'),
+  body('class_allocations.*.classes_allocated').optional().isInt({ min: 1 }).withMessage('Classes allocated must be at least 1')
 ];
 
 const paymentIdValidation = [
@@ -161,7 +164,25 @@ router.post('/', paymentValidation, async (req, res, next) => {
       return res.status(400).json({ success: false, errors: errors.array() });
     }
 
-    const { student_id, payment_method, amount, classes_purchased, payment_reference, notes } = req.body;
+    const { student_id, payment_method, amount, classes_purchased, payment_reference, notes, class_allocations } = req.body;
+
+    // If class_allocations are provided, validate that student is enrolled in those classes
+    if (class_allocations && Array.isArray(class_allocations)) {
+      for (const allocation of class_allocations) {
+        const enrollmentCheck = await client.query(
+          'SELECT id FROM student_class_enrollments WHERE student_id = $1 AND class_id = $2 AND is_active = true',
+          [student_id, allocation.class_id]
+        );
+
+        if (enrollmentCheck.rows.length === 0) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            success: false,
+            error: { message: `Student is not enrolled in class ${allocation.class_id}` }
+          });
+        }
+      }
+    }
 
     // Calculate classes remaining (initially same as purchased)
     const classes_remaining = classes_purchased;
@@ -178,6 +199,16 @@ router.post('/', paymentValidation, async (req, res, next) => {
     ]);
 
     const payment = paymentResult.rows[0];
+
+    // If class allocations are provided, create them
+    if (class_allocations && Array.isArray(class_allocations)) {
+      for (const allocation of class_allocations) {
+        await client.query(
+          'INSERT INTO payment_class_allocations (payment_id, class_id, classes_allocated) VALUES ($1, $2, $3)',
+          [payment.id, allocation.class_id, allocation.allocated_classes]
+        );
+      }
+    }
 
     await client.query('COMMIT');
 
@@ -308,9 +339,9 @@ router.post('/:id/allocate', paymentIdValidation, async (req, res, next) => {
     }
 
     const { id } = req.params;
-    const { class_allocations } = req.body; // Array of {class_id, classes_allocated}
+    const { allocations } = req.body; // Array of {class_id, classes_allocated}
 
-    if (!Array.isArray(class_allocations) || class_allocations.length === 0) {
+    if (!Array.isArray(allocations) || allocations.length === 0) {
       await client.query('ROLLBACK');
       return res.status(400).json({
         success: false,
@@ -331,7 +362,7 @@ router.post('/:id/allocate', paymentIdValidation, async (req, res, next) => {
     }
 
     const payment = paymentResult.rows[0];
-    const totalClassesToAllocate = class_allocations.reduce((sum, allocation) => sum + allocation.classes_allocated, 0);
+    const totalClassesToAllocate = allocations.reduce((sum, allocation) => sum + allocation.allocated_classes, 0);
 
     if (totalClassesToAllocate > payment.classes_remaining) {
       await client.query('ROLLBACK');
@@ -345,12 +376,12 @@ router.post('/:id/allocate', paymentIdValidation, async (req, res, next) => {
     await client.query('DELETE FROM payment_class_allocations WHERE payment_id = $1', [id]);
 
     // Create new allocations
-    for (const allocation of class_allocations) {
+    for (const allocation of allocations) {
       const allocationQuery = `
         INSERT INTO payment_class_allocations (payment_id, class_id, classes_allocated)
         VALUES ($1, $2, $3)
       `;
-      await client.query(allocationQuery, [id, allocation.class_id, allocation.classes_allocated]);
+      await client.query(allocationQuery, [id, allocation.class_id, allocation.allocated_classes]);
     }
 
     // Update payment classes remaining

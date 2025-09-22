@@ -374,6 +374,45 @@ router.delete('/:id/schedules/:scheduleId',
     }
   });
 
+// Get class enrollments (students enrolled in a specific class)
+router.get('/:id/enrollments', classIdValidation, async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    const { id } = req.params;
+
+    const queryStr = `
+      SELECT
+        sce.id as enrollment_id,
+        sce.student_id,
+        s.name as student_name,
+        s.grade,
+        s.email,
+        sce.enrolled_at,
+        sce.is_active
+      FROM student_class_enrollments sce
+      JOIN students s ON sce.student_id = s.id
+      WHERE sce.class_id = $1 AND sce.is_active = true
+      ORDER BY s.name
+    `;
+
+    const result = await query(queryStr, [id]);
+
+    res.json({
+      success: true,
+      data: {
+        enrollments: result.rows,
+        total: result.rows.length
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Get upcoming class occurrences
 router.get('/:id/occurrences', classIdValidation, async (req, res, next) => {
   try {

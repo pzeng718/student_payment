@@ -1,16 +1,20 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Typography, Table, Button, Space, Modal, Form, Select,
   Popconfirm, message, Tag, Card, Statistic, Row, Col, Progress,
-  Tabs, List, DatePicker, Calendar, Badge, Divider, Input
+  Tabs, List, DatePicker, Calendar, Badge, Divider, Input, TimePicker,
+  Transfer, Checkbox, Tooltip
 } from 'antd';
 import {
   PlusOutlined, EditOutlined, DeleteOutlined, SearchOutlined,
-  CalendarOutlined, CheckCircleOutlined, ClockCircleOutlined,
-  UserOutlined, BookOutlined, TeamOutlined
+  CalendarOutlined,
+  UserOutlined, BookOutlined, TeamOutlined, ExclamationCircleOutlined,
+  DollarOutlined
 } from '@ant-design/icons';
 import axios from 'axios';
 import type { ColumnsType } from 'antd/es/table';
+import type { TransferDirection } from 'antd/es/transfer';
+import type { Key } from 'react';
 import dayjs, { Dayjs } from 'dayjs';
 
 const { Title, Text } = Typography;
@@ -29,15 +33,41 @@ interface ClassOccurrence {
   present_count: number;
   absent_count: number;
   attendance_percentage: number;
+  is_auto_created?: boolean;
+  notes?: string;
 }
 
 interface AttendanceRecord {
-  id: string;
   student_id: string;
   student_name: string;
   grade: string;
-  attendance_status: 'present' | 'absent' | 'late';
+  enrollment_id: string;
+  attendance_status: 'present' | 'absent' | 'late' | 'excused' | 'not_recorded';
   notes?: string;
+  attendance_notes?: string;
+  is_excluded?: boolean;
+  exclusion_reason?: string;
+}
+
+interface ScheduledClass {
+  id: string;
+  schedule_id: string;
+  class_id: string;
+  class_name: string;
+  subject: string;
+  date: string;
+  start_time: string;
+  end_time: string;
+  price_per_class: number;
+  max_students: number;
+  description: string;
+  has_occurrence: boolean;
+  is_scheduled: boolean;
+}
+
+interface StudentExclusion {
+  student_id: string;
+  reason?: string;
 }
 
 interface Student {
@@ -55,13 +85,17 @@ interface Class {
 const statusColors = {
   present: 'green',
   absent: 'red',
-  late: 'orange'
+  late: 'orange',
+  excused: 'blue',
+  not_recorded: 'default'
 };
 
 const statusLabels = {
   present: 'Present',
   absent: 'Absent',
-  late: 'Late'
+  late: 'Late',
+  excused: 'Excused',
+  not_recorded: 'Not Recorded'
 };
 
 const Attendance: React.FC = () => {
@@ -77,10 +111,82 @@ const Attendance: React.FC = () => {
   const [searchText, setSearchText] = useState('');
   const [statusFilter, setStatusFilter] = useState<string | undefined>();
   const [form] = Form.useForm();
+  const [exclusionForm] = Form.useForm();
+  const [selectedClassId, setSelectedClassId] = useState<string>('');
+  const [enrolledStudents, setEnrolledStudents] = useState<Student[]>([]);
+  const [excludedStudents, setExcludedStudents] = useState<Key[]>([]);
+  const [exclusionModalVisible, setExclusionModalVisible] = useState(false);
+  const [editOccurrenceModalVisible, setEditOccurrenceModalVisible] = useState(false);
+  const [editingOccurrence, setEditingOccurrence] = useState<ClassOccurrence | null>(null);
+  const [editForm] = Form.useForm();
+  const [scheduledClasses, setScheduledClasses] = useState<ScheduledClass[]>([]);
+  const [selectedView, setSelectedView] = useState<'month' | 'day'>('month');
+
+  // Search caching
+  const searchCache = useRef<Map<string, { data: ClassOccurrence[], timestamp: number }>>(new Map());
+  const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+  const generateCacheKey = useCallback((search: string, status: string | undefined) => {
+    return `${search || ''}_${status || 'all'}`;
+  }, []);
+
+  const getCachedResult = useCallback((key: string): ClassOccurrence[] | null => {
+    const cached = searchCache.current.get(key);
+    if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+      return cached.data;
+    }
+    return null;
+  }, []);
+
+  const setCachedResult = useCallback((key: string, data: ClassOccurrence[]) => {
+    searchCache.current.set(key, {
+      data: [...data],
+      timestamp: Date.now()
+    });
+
+    // Limit cache size to prevent memory issues
+    if (searchCache.current.size > 20) {
+      const firstKey = searchCache.current.keys().next().value;
+      if (firstKey) {
+        searchCache.current.delete(firstKey);
+      }
+    }
+  }, []);
+
+  const clearCache = useCallback(() => {
+    searchCache.current.clear();
+  }, []);
+
+  // Fetch scheduled classes for calendar view
+  const fetchScheduledClasses = async () => {
+    try {
+      const startDate = selectedDate.startOf('month').format('YYYY-MM-DD');
+      const endDate = selectedDate.endOf('month').format('YYYY-MM-DD');
+
+      const response = await axios.get('/api/attendance/scheduled-classes', {
+        params: { start_date: startDate, end_date: endDate }
+      });
+
+      setScheduledClasses(response.data.data?.scheduled_classes || []);
+    } catch (error: any) {
+      console.error('Error fetching scheduled classes:', error);
+    }
+  };
 
   const fetchOccurrences = async () => {
     try {
       setLoading(true);
+
+      const cacheKey = generateCacheKey(searchText, statusFilter);
+      const cachedData = getCachedResult(cacheKey);
+
+      if (cachedData) {
+        console.log('Using cached occurrences data');
+        setOccurrences(cachedData);
+        setLoading(false);
+        return;
+      }
+
       const params: any = {
         date_from: selectedDate.startOf('month').format('YYYY-MM-DD'),
         date_to: selectedDate.endOf('month').format('YYYY-MM-DD')
@@ -88,7 +194,11 @@ const Attendance: React.FC = () => {
       if (searchText) params.search = searchText;
 
       const response = await axios.get('/api/attendance/occurrences', { params });
-      setOccurrences(response.data.occurrences || []);
+      const occurrencesData = response.data.data?.occurrences || [];
+      console.log('Fetched occurrences from API:', occurrencesData);
+
+      setOccurrences(occurrencesData);
+      setCachedResult(cacheKey, occurrencesData);
     } catch (error: any) {
       console.error('Error fetching occurrences:', error);
       message.error(error.response?.data?.message || 'Failed to fetch occurrences');
@@ -121,10 +231,26 @@ const Attendance: React.FC = () => {
     }
   };
 
+  const fetchEnrolledStudents = async (classId: string) => {
+    try {
+      const response = await axios.get(`/api/classes/${classId}/enrollments`);
+      const enrolledData = response.data.data?.enrollments || [];
+      const studentsData = enrolledData.map((enrollment: any) => ({
+        id: enrollment.student_id,
+        name: enrollment.student_name,
+        grade: enrollment.grade
+      }));
+      setEnrolledStudents(studentsData);
+    } catch (error: any) {
+      console.error('Error fetching enrolled students:', error);
+      message.error('Failed to fetch enrolled students');
+    }
+  };
+
   const fetchAttendanceForOccurrence = async (occurrenceId: string) => {
     try {
       const response = await axios.get(`/api/attendance/occurrences/${occurrenceId}`);
-      setAttendanceRecords(response.data.attendance || []);
+      setAttendanceRecords(response.data.data?.attendance || []);
     } catch (error: any) {
       console.error('Error fetching attendance:', error);
       message.error(error.response?.data?.message || 'Failed to fetch attendance records');
@@ -133,16 +259,33 @@ const Attendance: React.FC = () => {
 
   useEffect(() => {
     fetchOccurrences();
+    fetchScheduledClasses();
     fetchStudents();
     fetchClasses();
   }, [selectedDate, searchText]);
 
   const handleCreateOccurrence = async (values: any) => {
     try {
-      await axios.post('/api/attendance/occurrences', values);
-      message.success('Class occurrence created successfully');
+      const payload = {
+        ...values,
+        occurrence_date: values.occurrence_date.format('YYYY-MM-DD'),
+        start_time: values.start_time?.format('HH:mm') || null,
+        end_time: values.end_time?.format('HH:mm') || null,
+        excluded_students: excludedStudents.map(studentId => ({
+          student_id: studentId as string,
+          reason: values[`exclusion_reason_${studentId}`] || null
+        }))
+      };
+
+      await axios.post('/api/attendance/occurrences', payload);
+      message.success('Class occurrence created successfully with automatic attendance and payment deduction');
       setModalVisible(false);
+      setExclusionModalVisible(false);
       form.resetFields();
+      exclusionForm.resetFields();
+      setExcludedStudents([]);
+      setEnrolledStudents([]);
+      setSelectedClassId('');
       fetchOccurrences();
     } catch (error: any) {
       console.error('Error creating occurrence:', error);
@@ -187,6 +330,124 @@ const Attendance: React.FC = () => {
     setOccurrenceModalVisible(true);
   };
 
+  const handleClassChange = async (classId: string) => {
+    setSelectedClassId(classId);
+    if (classId) {
+      await fetchEnrolledStudents(classId);
+      setExcludedStudents([]);
+    } else {
+      setEnrolledStudents([]);
+    }
+  };
+
+  const handleExclusionChange = (targetKeys: Key[], direction: TransferDirection, moveKeys: Key[]) => {
+    setExcludedStudents(targetKeys);
+  };
+
+  const handleUpdateAttendanceWithPayment = async (occurrenceId: string, studentId: string, status: string, updatePayment: boolean, notes?: string) => {
+    try {
+      await axios.put(`/api/attendance/occurrences/${occurrenceId}/attendance-with-payment`, {
+        student_id: studentId,
+        attendance_status: status,
+        update_payment_balance: updatePayment,
+        notes
+      });
+      message.success('Attendance updated successfully');
+      if (selectedOccurrence) {
+        await fetchAttendanceForOccurrence(selectedOccurrence.id);
+      }
+    } catch (error: any) {
+      console.error('Error updating attendance:', error);
+      message.error(error.response?.data?.message || 'Failed to update attendance');
+    }
+  };
+
+  const handleAddExclusion = async (values: any) => {
+    try {
+      if (!selectedOccurrence) return;
+
+      await axios.post(`/api/attendance/occurrences/${selectedOccurrence.id}/exclusions`, {
+        student_id: values.student_id,
+        reason: values.reason
+      });
+      message.success('Student excluded from occurrence');
+      exclusionForm.resetFields();
+      await fetchAttendanceForOccurrence(selectedOccurrence.id);
+    } catch (error: any) {
+      console.error('Error adding exclusion:', error);
+      message.error(error.response?.data?.message || 'Failed to add exclusion');
+    }
+  };
+
+  const handleRemoveExclusion = async (studentId: string) => {
+    try {
+      if (!selectedOccurrence) return;
+
+      await axios.delete(`/api/attendance/occurrences/${selectedOccurrence.id}/exclusions/${studentId}`);
+      message.success('Student exclusion removed');
+      await fetchAttendanceForOccurrence(selectedOccurrence.id);
+    } catch (error: any) {
+      console.error('Error removing exclusion:', error);
+      message.error(error.response?.data?.message || 'Failed to remove exclusion');
+    }
+  };
+
+  const handleEditOccurrence = async (values: any) => {
+    try {
+      if (!editingOccurrence) return;
+
+      const payload = {
+        start_time: values.start_time?.format('HH:mm') || null,
+        end_time: values.end_time?.format('HH:mm') || null,
+        notes: values.notes,
+        was_cancelled: values.was_cancelled || false
+      };
+
+      await axios.put(`/api/attendance/occurrences/${editingOccurrence.id}`, payload);
+      message.success('Occurrence updated successfully');
+      setEditOccurrenceModalVisible(false);
+      setEditingOccurrence(null);
+      editForm.resetFields();
+      fetchOccurrences();
+    } catch (error: any) {
+      console.error('Error updating occurrence:', error);
+      message.error(error.response?.data?.message || 'Failed to update occurrence');
+    }
+  };
+
+  const showEditOccurrenceModal = (occurrence: ClassOccurrence) => {
+    setEditingOccurrence(occurrence);
+    editForm.setFieldsValue({
+      start_time: occurrence.start_time ? dayjs(occurrence.start_time, 'HH:mm') : null,
+      end_time: occurrence.end_time ? dayjs(occurrence.end_time, 'HH:mm') : null,
+      notes: occurrence.notes || '',
+      was_cancelled: occurrence.is_cancelled
+    });
+    setEditOccurrenceModalVisible(true);
+  };
+
+  const handleAutoCreateOccurrences = async () => {
+    try {
+      const response = await axios.post('/api/attendance/auto-create-occurrences');
+      const { created, occurrences, errors } = response.data.data;
+
+      if (created > 0) {
+        message.success(`Successfully created ${created} class occurrences`);
+        fetchOccurrences(); // Refresh the list
+      } else {
+        message.info('No new occurrences were created (may already exist for today)');
+      }
+
+      if (errors && errors.length > 0) {
+        console.error('Auto-creation errors:', errors);
+        message.warning(`${errors.length} occurrences failed to create. Check console for details.`);
+      }
+    } catch (error: any) {
+      console.error('Error auto-creating occurrences:', error);
+      message.error(error.response?.data?.message || 'Failed to auto-create occurrences');
+    }
+  };
+
   const occurrenceColumns: ColumnsType<ClassOccurrence> = [
     {
       title: 'Class',
@@ -198,19 +459,6 @@ const Attendance: React.FC = () => {
           <Text strong>{name}</Text>
           <Text type="secondary" style={{ fontSize: '12px' }}>
             {dayjs(record.occurrence_date).format('MMM DD, YYYY')} • {record.start_time} - {record.end_time}
-          </Text>
-        </Space>
-      ),
-    },
-    {
-      title: 'Enrollment',
-      dataIndex: 'total_enrolled',
-      key: 'total_enrolled',
-      render: (total: number, record: ClassOccurrence) => (
-        <Space direction="vertical" size={0}>
-          <Text strong>{total} enrolled</Text>
-          <Text type="secondary" style={{ fontSize: '12px' }}>
-            {record.present_count} present • {record.absent_count} absent
           </Text>
         </Space>
       ),
@@ -236,10 +484,15 @@ const Attendance: React.FC = () => {
       title: 'Status',
       dataIndex: 'is_cancelled',
       key: 'is_cancelled',
-      render: (cancelled: boolean) => (
-        <Tag color={cancelled ? 'red' : 'green'}>
-          {cancelled ? 'Cancelled' : 'Scheduled'}
-        </Tag>
+      render: (cancelled: boolean, record: ClassOccurrence) => (
+        <Space direction="vertical" size={0}>
+          <Tag color={cancelled ? 'red' : 'green'}>
+            {cancelled ? 'Cancelled' : 'Scheduled'}
+          </Tag>
+          {record.is_auto_created && (
+            <Tag color="blue">Auto-created</Tag>
+          )}
+        </Space>
       ),
       filters: [
         { text: 'Scheduled', value: false },
@@ -259,6 +512,12 @@ const Attendance: React.FC = () => {
           >
             View Attendance
           </Button>
+          <Button
+            icon={<EditOutlined />}
+            onClick={() => showEditOccurrenceModal(record)}
+          >
+            Edit
+          </Button>
         </Space>
       ),
     },
@@ -276,6 +535,12 @@ const Attendance: React.FC = () => {
           <Text type="secondary" style={{ fontSize: '12px' }}>
             Grade: {record.grade}
           </Text>
+          {record.is_excluded && (
+            <Tag color="orange">
+              <ExclamationCircleOutlined /> Excluded
+              {record.exclusion_reason && `: ${record.exclusion_reason}`}
+            </Tag>
+          )}
         </Space>
       ),
     },
@@ -304,7 +569,7 @@ const Attendance: React.FC = () => {
       title: 'Actions',
       key: 'actions',
       render: (_, record: AttendanceRecord) => (
-        <Space>
+        <Space direction="vertical" size={0}>
           <Select
             value={record.attendance_status}
             style={{ width: 120 }}
@@ -318,6 +583,18 @@ const Attendance: React.FC = () => {
               <Option key={key} value={key}>{label}</Option>
             ))}
           </Select>
+          <Tooltip title="Update with payment balance changes">
+            <Checkbox
+              onChange={(e) => handleUpdateAttendanceWithPayment(
+                selectedOccurrence!.id,
+                record.student_id,
+                record.attendance_status,
+                e.target.checked
+              )}
+            >
+              Update Balance
+            </Checkbox>
+          </Tooltip>
         </Space>
       ),
     },
@@ -326,7 +603,10 @@ const Attendance: React.FC = () => {
   const totalOccurrences = occurrences.length;
   const cancelledOccurrences = occurrences.filter(o => o.is_cancelled).length;
   const avgAttendanceRate = occurrences.length > 0
-    ? occurrences.reduce((sum, o) => sum + o.attendance_percentage, 0) / occurrences.length
+    ? occurrences.reduce((sum, o) => {
+        const percentage = o.attendance_percentage;
+        return sum + (typeof percentage === 'number' && !isNaN(percentage) ? percentage : 0);
+      }, 0) / occurrences.length
     : 0;
 
   const getListData = (value: Dayjs) => {
@@ -338,21 +618,76 @@ const Attendance: React.FC = () => {
 
   const dateCellRender = (value: Dayjs) => {
     const listData = getListData(value);
+    const dateStr = value.format('YYYY-MM-DD');
+    const dayScheduledClasses = scheduledClasses.filter(sc => sc.date === dateStr);
+
     return (
-      <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
-        {listData.map((item, index) => (
-          <li key={index}>
-            <Badge
-              status={item.is_cancelled ? 'error' : 'success'}
-              text={
-                <span style={{ fontSize: '11px' }}>
-                  {item.class_name} ({item.attendance_percentage.toFixed(0)}%)
-                </span>
-              }
-            />
-          </li>
-        ))}
-      </ul>
+      <div style={{ padding: '4px' }}>
+        {/* Actual occurrences */}
+        {listData.length > 0 && (
+          <div style={{ marginBottom: '4px' }}>
+            <div style={{ fontSize: '10px', color: '#666', marginBottom: '2px', fontWeight: 'bold' }}>
+              📅 Classes
+            </div>
+            <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+              {listData.map((item, index) => (
+                <li key={`occurrence-${index}`} style={{ marginBottom: '2px' }}>
+                  <Badge
+                    status={item.is_cancelled ? 'error' : 'success'}
+                    text={
+                      <span style={{ fontSize: '10px', fontWeight: '500' }}>
+                        {item.class_name}
+                        {item.is_auto_created && (
+                          <span style={{ marginLeft: '4px', color: '#1890ff' }}>🤖</span>
+                        )}
+                      </span>
+                    }
+                  />
+                  <div style={{ fontSize: '9px', color: '#999', marginLeft: '14px' }}>
+                    {item.start_time} - {item.attendance_percentage.toFixed(0)}% attendance
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* Scheduled classes */}
+        {dayScheduledClasses.length > 0 && (
+          <div>
+            <div style={{ fontSize: '10px', color: '#666', marginBottom: '2px', fontWeight: 'bold' }}>
+              📋 Scheduled
+            </div>
+            <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+              {dayScheduledClasses.map((item, index) => (
+                <li key={`scheduled-${index}`} style={{ marginBottom: '2px' }}>
+                  <Badge
+                    status={item.has_occurrence ? 'default' : 'processing'}
+                    text={
+                      <span style={{ fontSize: '10px', fontWeight: '500' }}>
+                        {item.class_name}
+                        {item.has_occurrence && (
+                          <span style={{ marginLeft: '4px', color: '#52c41a' }}>✅</span>
+                        )}
+                      </span>
+                    }
+                  />
+                  <div style={{ fontSize: '9px', color: '#999', marginLeft: '14px' }}>
+                    {item.start_time} - {item.end_time}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* Empty state */}
+        {listData.length === 0 && dayScheduledClasses.length === 0 && (
+          <div style={{ textAlign: 'center', padding: '8px 0' }}>
+            <span style={{ fontSize: '10px', color: '#ccc' }}>No classes</span>
+          </div>
+        )}
+      </div>
     );
   };
 
@@ -409,6 +744,152 @@ const Attendance: React.FC = () => {
             />
           </Card>
         </TabPane>
+        <TabPane tab="Day View" key="day">
+          <Card>
+            <div style={{ padding: '20px' }}>
+              <Title level={4} style={{ textAlign: 'center', marginBottom: '20px' }}>
+                📅 {selectedDate.format('dddd, MMMM DD, YYYY')}
+              </Title>
+
+              {(() => {
+                const dateStr = selectedDate.format('YYYY-MM-DD');
+                const dayOccurrences = occurrences.filter(occ => occ.occurrence_date === dateStr);
+                const dayScheduledClasses = scheduledClasses.filter(sc => sc.date === dateStr);
+
+                if (dayOccurrences.length === 0 && dayScheduledClasses.length === 0) {
+                  return (
+                    <div style={{ textAlign: 'center', padding: '40px' }}>
+                      <Text type="secondary">No classes scheduled for this day</Text>
+                    </div>
+                  );
+                }
+
+                return (
+                  <Row gutter={[16, 16]}>
+                    {/* Actual occurrences */}
+                    {dayOccurrences.length > 0 && (
+                      <Col span={24}>
+                        <Title level={5} style={{ color: '#1890ff' }}>📅 Today's Classes</Title>
+                        <List
+                          dataSource={dayOccurrences}
+                          renderItem={(occurrence) => (
+                            <List.Item style={{ padding: '12px', border: '1px solid #f0f0f0', borderRadius: '6px', marginBottom: '8px' }}>
+                              <List.Item.Meta
+                                avatar={
+                                  <div style={{
+                                    width: '12px',
+                                    height: '12px',
+                                    borderRadius: '50%',
+                                    backgroundColor: occurrence.is_cancelled ? '#ff4d4f' : '#52c41a',
+                                    marginTop: '4px'
+                                  }} />
+                                }
+                                title={
+                                  <Space>
+                                    <Text strong>{occurrence.class_name}</Text>
+                                    {occurrence.is_auto_created && (
+                                      <Tag color="blue">Auto</Tag>
+                                    )}
+                                  </Space>
+                                }
+                                description={
+                                  <div>
+                                    <Text type="secondary">
+                                      {occurrence.start_time} - {occurrence.end_time}
+                                    </Text>
+                                    <div style={{ marginTop: '4px' }}>
+                                      <Progress
+                                        percent={occurrence.attendance_percentage}
+                                        size="small"
+                                        status={occurrence.is_cancelled ? 'exception' : 'success'}
+                                        format={(percent) => `${percent?.toFixed(0)}% attendance`}
+                                      />
+                                    </div>
+                                  </div>
+                                }
+                              />
+                              <Space>
+                                <Button
+                                  size="small"
+                                  onClick={() => showOccurrenceModal(occurrence)}
+                                >
+                                  View Details
+                                </Button>
+                                <Button
+                                  size="small"
+                                  icon={<EditOutlined />}
+                                  onClick={() => showEditOccurrenceModal(occurrence)}
+                                >
+                                  Edit
+                                </Button>
+                              </Space>
+                            </List.Item>
+                          )}
+                        />
+                      </Col>
+                    )}
+
+                    {/* Scheduled classes */}
+                    {dayScheduledClasses.length > 0 && (
+                      <Col span={24}>
+                        <Title level={5} style={{ color: '#fa8c16' }}>📋 Scheduled Classes</Title>
+                        <List
+                          dataSource={dayScheduledClasses}
+                          renderItem={(scheduledClass) => (
+                            <List.Item style={{
+                              padding: '12px',
+                              border: '1px solid #fff7e6',
+                              borderRadius: '6px',
+                              marginBottom: '8px',
+                              backgroundColor: '#fff7e6'
+                            }}>
+                              <List.Item.Meta
+                                avatar={
+                                  <div style={{
+                                    width: '12px',
+                                    height: '12px',
+                                    borderRadius: '50%',
+                                    backgroundColor: scheduledClass.has_occurrence ? '#52c41a' : '#fa8c16',
+                                    marginTop: '4px'
+                                  }} />
+                                }
+                                title={
+                                  <Space>
+                                    <Text strong>{scheduledClass.class_name}</Text>
+                                    {scheduledClass.has_occurrence && (
+                                      <Tag color="green">Created</Tag>
+                                    )}
+                                  </Space>
+                                }
+                                description={
+                                  <div>
+                                    <Text type="secondary">
+                                      {scheduledClass.subject} • {scheduledClass.start_time} - {scheduledClass.end_time}
+                                    </Text>
+                                    <div style={{ marginTop: '4px' }}>
+                                      <Text type="secondary" style={{ fontSize: '12px' }}>
+                                        {scheduledClass.description}
+                                      </Text>
+                                    </div>
+                                  </div>
+                                }
+                              />
+                              <div style={{ textAlign: 'right' }}>
+                                <Text strong style={{ color: '#fa8c16' }}>
+                                  ${scheduledClass.price_per_class}
+                                </Text>
+                              </div>
+                            </List.Item>
+                          )}
+                        />
+                      </Col>
+                    )}
+                  </Row>
+                );
+              })()}
+            </div>
+          </Card>
+        </TabPane>
 
         <TabPane tab="Occurrences List" key="occurrences">
           <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
@@ -428,7 +909,7 @@ const Attendance: React.FC = () => {
                 allowClear={false}
               />
             </Col>
-            <Col xs={24} sm={12} md={8}>
+            <Col xs={24} sm={12} md={6}>
               <Button
                 type="primary"
                 icon={<PlusOutlined />}
@@ -439,6 +920,16 @@ const Attendance: React.FC = () => {
                 style={{ width: '100%' }}
               >
                 Add Occurrence
+              </Button>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
+              <Button
+                type="default"
+                icon={<CalendarOutlined />}
+                onClick={handleAutoCreateOccurrences}
+                style={{ width: '100%' }}
+              >
+                Auto-Create Today
               </Button>
             </Col>
           </Row>
@@ -465,54 +956,125 @@ const Attendance: React.FC = () => {
         onCancel={() => {
           setModalVisible(false);
           form.resetFields();
+          setExcludedStudents([]);
+          setEnrolledStudents([]);
+          setSelectedClassId('');
         }}
         footer={null}
-        width={600}
+        width={800}
       >
         <Form
           form={form}
           layout="vertical"
           onFinish={handleCreateOccurrence}
         >
-          <Form.Item
-            name="class_id"
-            label="Class"
-            rules={[{ required: true, message: 'Please select a class' }]}
-          >
-            <Select
-              placeholder={classes.length === 0 ? "Loading classes..." : "Select class"}
-              disabled={classes.length === 0}
-              showSearch
-              optionFilterProp="children"
-            >
-              {classes.map(cls => (
-                <Option key={cls.id} value={cls.id}>{cls.name}</Option>
-              ))}
-            </Select>
-          </Form.Item>
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item
+                name="class_id"
+                label="Class"
+                rules={[{ required: true, message: 'Please select a class' }]}
+              >
+                <Select
+                  placeholder={classes.length === 0 ? "Loading classes..." : "Select class"}
+                  disabled={classes.length === 0}
+                  showSearch
+                  optionFilterProp="children"
+                  onChange={handleClassChange}
+                >
+                  {classes.map(cls => (
+                    <Option key={cls.id} value={cls.id}>{cls.name}</Option>
+                  ))}
+                </Select>
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item
+                name="occurrence_date"
+                label="Date"
+                rules={[{ required: true, message: 'Please select date' }]}
+              >
+                <DatePicker style={{ width: '100%' }} />
+              </Form.Item>
+            </Col>
+          </Row>
+
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item
+                name="start_time"
+                label="Start Time"
+                rules={[{ required: true, message: 'Please select start time' }]}
+              >
+                <TimePicker
+                  format="HH:mm"
+                  style={{ width: '100%' }}
+                  placeholder="Select start time"
+                />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item
+                name="end_time"
+                label="End Time"
+                rules={[{ required: true, message: 'Please select end time' }]}
+              >
+                <TimePicker
+                  format="HH:mm"
+                  style={{ width: '100%' }}
+                  placeholder="Select end time"
+                />
+              </Form.Item>
+            </Col>
+          </Row>
+
+          {selectedClassId && enrolledStudents.length > 0 && (
+            <Form.Item label="Exclude Students (Optional)">
+              <div style={{ marginBottom: 16 }}>
+                <Text type="secondary">
+                  Select students to exclude from this occurrence. Excluded students won't be marked as present and won't have their payment balance deducted.
+                </Text>
+              </div>
+              <Transfer
+                dataSource={enrolledStudents.map(student => ({
+                  key: student.id,
+                  title: `${student.name} (${student.grade})`,
+                  description: student.grade
+                }))}
+                targetKeys={excludedStudents}
+                onChange={handleExclusionChange}
+                render={item => item.title}
+                listStyle={{ width: '45%', height: 300 }}
+                titles={['Enrolled Students', 'Excluded Students']}
+                showSearch
+                filterOption={(inputValue, option) =>
+                  option.title.toLowerCase().includes(inputValue.toLowerCase())
+                }
+              />
+              {excludedStudents.map(studentId => {
+                const student = enrolledStudents.find(s => s.id === studentId);
+                return (
+                  <Form.Item
+                    key={studentId}
+                    name={`exclusion_reason_${studentId}`}
+                    label={`Reason for excluding ${student?.name}`}
+                    style={{ marginTop: 16 }}
+                  >
+                    <Input placeholder="e.g., Sick, Family emergency, etc." />
+                  </Form.Item>
+                );
+              })}
+            </Form.Item>
+          )}
 
           <Form.Item
-            name="occurrence_date"
-            label="Date"
-            rules={[{ required: true, message: 'Please select date' }]}
+            name="notes"
+            label="Notes"
           >
-            <DatePicker style={{ width: '100%' }} />
-          </Form.Item>
-
-          <Form.Item
-            name="start_time"
-            label="Start Time"
-            rules={[{ required: true, message: 'Please enter start time' }]}
-          >
-            <Input placeholder="09:00" />
-          </Form.Item>
-
-          <Form.Item
-            name="end_time"
-            label="End Time"
-            rules={[{ required: true, message: 'Please enter end time' }]}
-          >
-            <Input placeholder="10:30" />
+            <Input.TextArea
+              placeholder="Additional notes about this occurrence"
+              rows={3}
+            />
           </Form.Item>
 
           <Form.Item>
@@ -524,6 +1086,9 @@ const Attendance: React.FC = () => {
                 onClick={() => {
                   setModalVisible(false);
                   form.resetFields();
+                  setExcludedStudents([]);
+                  setEnrolledStudents([]);
+                  setSelectedClassId('');
                 }}
               >
                 Cancel
@@ -541,8 +1106,19 @@ const Attendance: React.FC = () => {
           setSelectedOccurrence(null);
           setAttendanceRecords([]);
         }}
-        footer={null}
-        width={1000}
+        footer={[
+          <Button key="add-exclusion" onClick={() => setExclusionModalVisible(true)}>
+            Add Exclusion
+          </Button>,
+          <Button key="close" onClick={() => {
+            setOccurrenceModalVisible(false);
+            setSelectedOccurrence(null);
+            setAttendanceRecords([]);
+          }}>
+            Close
+          </Button>
+        ]}
+        width={1200}
       >
         <div style={{ marginBottom: 16 }}>
           <Text strong>
@@ -550,12 +1126,43 @@ const Attendance: React.FC = () => {
             {selectedOccurrence?.start_time} - {selectedOccurrence?.end_time}
           </Text>
           <Divider />
-          <Text>
-            Total Enrolled: {selectedOccurrence?.total_enrolled} |
-            Present: {attendanceRecords.filter(r => r.attendance_status === 'present').length} |
-            Absent: {attendanceRecords.filter(r => r.attendance_status === 'absent').length} |
-            Late: {attendanceRecords.filter(r => r.attendance_status === 'late').length}
-          </Text>
+          <Row gutter={16}>
+            <Col span={6}>
+              <Statistic
+                title="Total Enrolled"
+                value={selectedOccurrence?.total_enrolled || 0}
+                prefix={<TeamOutlined />}
+              />
+            </Col>
+            <Col span={6}>
+              <Statistic
+                title="Present"
+                value={attendanceRecords.filter(r => r.attendance_status === 'present').length}
+                valueStyle={{ color: '#52c41a' }}
+              />
+            </Col>
+            <Col span={6}>
+              <Statistic
+                title="Absent"
+                value={attendanceRecords.filter(r => r.attendance_status === 'absent').length}
+                valueStyle={{ color: '#cf1322' }}
+              />
+            </Col>
+            <Col span={6}>
+              <Statistic
+                title="Not Recorded"
+                value={attendanceRecords.filter(r => r.attendance_status === 'not_recorded').length}
+                valueStyle={{ color: '#8c8c8c' }}
+              />
+            </Col>
+            <Col span={6}>
+              <Statistic
+                title="Excluded"
+                value={attendanceRecords.filter(r => r.is_excluded).length}
+                valueStyle={{ color: '#fa8c16' }}
+              />
+            </Col>
+          </Row>
         </div>
 
         <Table
@@ -569,6 +1176,148 @@ const Attendance: React.FC = () => {
           }}
           scroll={{ x: 800 }}
         />
+      </Modal>
+
+      <Modal
+        title="Edit Class Occurrence"
+        open={editOccurrenceModalVisible}
+        onCancel={() => {
+          setEditOccurrenceModalVisible(false);
+          setEditingOccurrence(null);
+          editForm.resetFields();
+        }}
+        footer={null}
+        width={600}
+      >
+        <Form
+          form={editForm}
+          layout="vertical"
+          onFinish={handleEditOccurrence}
+        >
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item
+                name="start_time"
+                label="Start Time"
+              >
+                <TimePicker
+                  format="HH:mm"
+                  style={{ width: '100%' }}
+                  placeholder="Select start time"
+                />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item
+                name="end_time"
+                label="End Time"
+              >
+                <TimePicker
+                  format="HH:mm"
+                  style={{ width: '100%' }}
+                  placeholder="Select end time"
+                />
+              </Form.Item>
+            </Col>
+          </Row>
+
+          <Form.Item
+            name="notes"
+            label="Notes"
+          >
+            <Input.TextArea
+              placeholder="Additional notes about this occurrence"
+              rows={3}
+            />
+          </Form.Item>
+
+          <Form.Item
+            name="was_cancelled"
+            valuePropName="checked"
+          >
+            <Checkbox>Cancel this occurrence</Checkbox>
+          </Form.Item>
+
+          <Form.Item>
+            <Space>
+              <Button type="primary" htmlType="submit">
+                Update Occurrence
+              </Button>
+              <Button
+                onClick={() => {
+                  setEditOccurrenceModalVisible(false);
+                  setEditingOccurrence(null);
+                  editForm.resetFields();
+                }}
+              >
+                Cancel
+              </Button>
+            </Space>
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        title="Add Student Exclusion"
+        open={exclusionModalVisible}
+        onCancel={() => {
+          setExclusionModalVisible(false);
+          exclusionForm.resetFields();
+        }}
+        footer={null}
+        width={500}
+      >
+        <Form
+          form={exclusionForm}
+          layout="vertical"
+          onFinish={handleAddExclusion}
+        >
+          <Form.Item
+            name="student_id"
+            label="Student"
+            rules={[{ required: true, message: 'Please select a student' }]}
+          >
+            <Select
+              placeholder="Select student to exclude"
+              showSearch
+              optionFilterProp="children"
+            >
+              {attendanceRecords
+                .filter(record => !record.is_excluded)
+                .map(record => (
+                  <Option key={record.student_id} value={record.student_id}>
+                    {record.student_name} ({record.grade})
+                  </Option>
+                ))}
+            </Select>
+          </Form.Item>
+
+          <Form.Item
+            name="reason"
+            label="Reason for Exclusion"
+          >
+            <Input.TextArea
+              placeholder="e.g., Sick, Family emergency, etc."
+              rows={3}
+            />
+          </Form.Item>
+
+          <Form.Item>
+            <Space>
+              <Button type="primary" htmlType="submit">
+                Add Exclusion
+              </Button>
+              <Button
+                onClick={() => {
+                  setExclusionModalVisible(false);
+                  exclusionForm.resetFields();
+                }}
+              >
+                Cancel
+              </Button>
+            </Space>
+          </Form.Item>
+        </Form>
       </Modal>
     </div>
   );

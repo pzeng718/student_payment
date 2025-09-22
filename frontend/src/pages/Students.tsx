@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Typography, Table, Button, Space, Modal, Form, Input, Select,
-  Popconfirm, message, Tag, Card, Statistic, Row, Col
+  Popconfirm, message, Tag, Card, Statistic, Row, Col, List
 } from 'antd';
 import {
   PlusOutlined, EditOutlined, DeleteOutlined, SearchOutlined,
@@ -30,6 +30,7 @@ interface Student {
   classes_attended?: number;
   classes_used?: number;
   attendance_percentage?: number;
+  enrolled_classes_count?: number;
 }
 
 interface Class {
@@ -37,6 +38,16 @@ interface Class {
   name: string;
   subject: string;
   price_per_class?: number;
+}
+
+interface ClassBalance {
+  class_id: string;
+  class_name: string;
+  subject: string;
+  classes_purchased: number;
+  classes_remaining: number;
+  classes_used: number;
+  classes_attended: number;
 }
 
 const Students: React.FC = () => {
@@ -48,22 +59,70 @@ const Students: React.FC = () => {
   const [searchText, setSearchText] = useState('');
   const [gradeFilter, setGradeFilter] = useState<string | undefined>();
   const [enrollmentModalVisible, setEnrollmentModalVisible] = useState(false);
+  const [balanceModalVisible, setBalanceModalVisible] = useState(false);
   const [selectedStudent, setSelectedStudent] = useState<Student | null>(null);
+  const [studentBalances, setStudentBalances] = useState<ClassBalance[]>([]);
   const [form] = Form.useForm();
   const [enrollmentForm] = Form.useForm();
 
-  // Fetch students
+  // Search caching
+  const searchCache = useRef<Map<string, { data: Student[], timestamp: number }>>(new Map());
+  const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+  const generateCacheKey = useCallback((search: string, grade: string | undefined) => {
+    return `${search || ''}_${grade || 'all'}`;
+  }, []);
+
+  const getCachedResult = useCallback((key: string) => {
+    const cached = searchCache.current.get(key);
+    if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+      return cached.data;
+    }
+    return null;
+  }, []);
+
+  const setCachedResult = useCallback((key: string, data: Student[]) => {
+    searchCache.current.set(key, {
+      data: [...data],
+      timestamp: Date.now()
+    });
+
+    // Limit cache size to prevent memory issues
+    if (searchCache.current.size > 20) {
+      const firstKey = searchCache.current.keys().next().value;
+      searchCache.current.delete(firstKey);
+    }
+  }, []);
+
+  const clearCache = useCallback(() => {
+    searchCache.current.clear();
+  }, []);
+
+  // Fetch students with caching
   const fetchStudents = async () => {
     try {
       setLoading(true);
+
+      const cacheKey = generateCacheKey(searchText, gradeFilter);
+      const cachedData = getCachedResult(cacheKey);
+
+      if (cachedData) {
+        console.log('Using cached students data');
+        setStudents(cachedData);
+        setLoading(false);
+        return;
+      }
+
       const params = new URLSearchParams();
       if (searchText) params.append('search', searchText);
       if (gradeFilter) params.append('grade', gradeFilter);
 
       const response = await axios.get(`/api/students?${params.toString()}`);
       const studentsData = response.data.data?.students || [];
-      console.log('Fetched students:', studentsData);
+      console.log('Fetched students from API:', studentsData);
+
       setStudents(studentsData);
+      setCachedResult(cacheKey, studentsData);
     } catch (error) {
       console.error('Error fetching students:', error);
       message.error('Failed to load students');
@@ -102,6 +161,7 @@ const Students: React.FC = () => {
       setModalVisible(false);
       setEditingStudent(null);
       form.resetFields();
+      clearCache(); // Clear cache when data changes
       fetchStudents();
     } catch (error: any) {
       console.error('Error saving student:', error);
@@ -114,6 +174,7 @@ const Students: React.FC = () => {
     try {
       await axios.delete(`/api/students/${id}`);
       message.success('Student deleted successfully');
+      clearCache(); // Clear cache when data changes
       fetchStudents();
     } catch (error: any) {
       console.error('Error deleting student:', error);
@@ -126,7 +187,10 @@ const Students: React.FC = () => {
     try {
       await axios.post(`/api/students/${studentId}/enroll/${classId}`);
       message.success('Student enrolled successfully');
+      clearCache(); // Clear cache when enrollment changes
+      // Refresh both students and classes data to ensure consistency
       fetchStudents();
+      fetchClasses();
     } catch (error: any) {
       console.error('Error enrolling student:', error);
       message.error(error.response?.data?.message || 'Failed to enroll student');
@@ -138,7 +202,10 @@ const Students: React.FC = () => {
     try {
       await axios.delete(`/api/students/${studentId}/unenroll/${classId}`);
       message.success('Student unenrolled successfully');
+      clearCache(); // Clear cache when enrollment changes
+      // Refresh both students and classes data to ensure consistency
       fetchStudents();
+      fetchClasses();
     } catch (error: any) {
       console.error('Error unenrolling student:', error);
       message.error(error.response?.data?.message || 'Failed to unenroll student');
@@ -148,6 +215,24 @@ const Students: React.FC = () => {
   const showEnrollmentModal = (student: Student) => {
     setSelectedStudent(student);
     setEnrollmentModalVisible(true);
+  };
+
+  const showBalanceModal = async (student: Student) => {
+    setSelectedStudent(student);
+    await fetchStudentBalances(student.id);
+    setBalanceModalVisible(true);
+  };
+
+  const fetchStudentBalances = async (studentId: string) => {
+    try {
+      const response = await axios.get(`/api/students/${studentId}/balances`);
+      const balances = response.data.data?.balances || [];
+      setStudentBalances(balances);
+    } catch (error: any) {
+      console.error('Error fetching student balances:', error);
+      message.error('Failed to load student balances');
+      setStudentBalances([]);
+    }
   };
 
   const handleEnrollmentSubmit = async (values: any) => {
@@ -204,16 +289,19 @@ const Students: React.FC = () => {
         <Space direction="vertical" size={0}>
           <div>
             <Text strong>
-              {record.total_classes_remaining || 0} classes remaining
+              {record.total_classes_remaining || 0} total classes remaining
             </Text>
           </div>
-          {record.total_classes_purchased && (
-            <div>
-              <Text type="secondary" style={{ fontSize: '12px' }}>
-                {record.total_classes_purchased} purchased
-              </Text>
-            </div>
-          )}
+          <div>
+            <Button
+              type="link"
+              size="small"
+              onClick={() => showBalanceModal(record)}
+              style={{ padding: 0, fontSize: '12px' }}
+            >
+              View per-class balances
+            </Button>
+          </div>
           {record.attendance_percentage !== undefined && (
             <div>
               <Text type="secondary" style={{ fontSize: '12px' }}>
@@ -229,7 +317,7 @@ const Students: React.FC = () => {
       key: 'classes',
       render: (record: Student) => (
         <Space direction="vertical" size={0}>
-          <Text strong>0 enrolled</Text>
+          <Text strong>{record.enrolled_classes_count || 0} enrolled</Text>
           <Button
             type="link"
             size="small"
@@ -526,6 +614,69 @@ const Students: React.FC = () => {
             </Space>
           </Form.Item>
         </Form>
+      </Modal>
+
+      {/* Balance Modal */}
+      <Modal
+        title={`Class Balances - ${selectedStudent?.name}`}
+        open={balanceModalVisible}
+        onCancel={() => {
+          setBalanceModalVisible(false);
+          setSelectedStudent(null);
+          setStudentBalances([]);
+        }}
+        footer={null}
+        width={800}
+      >
+        <div style={{ marginBottom: 16 }}>
+          <Text type="secondary">
+            Detailed balance information for each class this student is enrolled in.
+          </Text>
+        </div>
+
+        {studentBalances.length > 0 ? (
+          <List
+            dataSource={studentBalances}
+            renderItem={(balance) => (
+              <List.Item>
+                <List.Item.Meta
+                  title={
+                    <Space>
+                      <Text strong>{balance.class_name}</Text>
+                      <Tag color="blue">{balance.subject}</Tag>
+                    </Space>
+                  }
+                  description={
+                    <Row gutter={16}>
+                      <Col span={6}>
+                        <Text type="secondary">Purchased: </Text>
+                        <Text strong>{balance.classes_purchased}</Text>
+                      </Col>
+                      <Col span={6}>
+                        <Text type="secondary">Remaining: </Text>
+                        <Text strong style={{ color: balance.classes_remaining > 0 ? '#52c41a' : '#cf1322' }}>
+                          {balance.classes_remaining}
+                        </Text>
+                      </Col>
+                      <Col span={6}>
+                        <Text type="secondary">Used: </Text>
+                        <Text>{balance.classes_used}</Text>
+                      </Col>
+                      <Col span={6}>
+                        <Text type="secondary">Attended: </Text>
+                        <Text>{balance.classes_attended}</Text>
+                      </Col>
+                    </Row>
+                  }
+                />
+              </List.Item>
+            )}
+          />
+        ) : (
+          <div style={{ textAlign: 'center', padding: '20px' }}>
+            <Text type="secondary">No balance information available for this student.</Text>
+          </div>
+        )}
       </Modal>
     </div>
   );

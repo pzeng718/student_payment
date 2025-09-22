@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Typography, Table, Button, Space, Modal, Form, Input, Select,
   Popconfirm, message, Tag, Card, Statistic, Row, Col, Progress,
@@ -54,6 +54,7 @@ const Classes: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
   const [scheduleModalVisible, setScheduleModalVisible] = useState(false);
+  const [addScheduleModalVisible, setAddScheduleModalVisible] = useState(false);
   const [editingClass, setEditingClass] = useState<Class | null>(null);
   const [selectedClass, setSelectedClass] = useState<Class | null>(null);
   const [selectedClassSchedules, setSelectedClassSchedules] = useState<Schedule[]>([]);
@@ -62,6 +63,39 @@ const Classes: React.FC = () => {
   const [subjectFilter, setSubjectFilter] = useState<string | undefined>();
   const [form] = Form.useForm();
   const [scheduleForm] = Form.useForm();
+
+  // Search caching
+  const searchCache = useRef<Map<string, { data: Class[], timestamp: number }>>(new Map());
+  const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+  const generateCacheKey = useCallback((search: string, subject: string | undefined) => {
+    return `${search || ''}_${subject || 'all'}`;
+  }, []);
+
+  const getCachedResult = useCallback((key: string) => {
+    const cached = searchCache.current.get(key);
+    if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+      return cached.data;
+    }
+    return null;
+  }, []);
+
+  const setCachedResult = useCallback((key: string, data: Class[]) => {
+    searchCache.current.set(key, {
+      data: [...data],
+      timestamp: Date.now()
+    });
+
+    // Limit cache size to prevent memory issues
+    if (searchCache.current.size > 20) {
+      const firstKey = searchCache.current.keys().next().value;
+      searchCache.current.delete(firstKey);
+    }
+  }, []);
+
+  const clearCache = useCallback(() => {
+    searchCache.current.clear();
+  }, []);
 
   const daysOfWeek = [
     { value: 0, label: 'Sunday' },
@@ -75,16 +109,31 @@ const Classes: React.FC = () => {
 
   const subjects = ['Mathematics', 'English', 'Science', 'Physics', 'Chemistry', 'Biology', 'History', 'Geography', 'Art', 'Music', 'Computer Science', 'Other'];
 
-  // Fetch classes
+  // Fetch classes with caching
   const fetchClasses = async () => {
     try {
       setLoading(true);
+
+      const cacheKey = generateCacheKey(searchText, subjectFilter);
+      const cachedData = getCachedResult(cacheKey);
+
+      if (cachedData) {
+        console.log('Using cached classes data');
+        setClasses(cachedData);
+        setLoading(false);
+        return;
+      }
+
       const params = new URLSearchParams();
       if (searchText) params.append('search', searchText);
       if (subjectFilter) params.append('subject', subjectFilter);
 
       const response = await axios.get(`/api/classes?${params.toString()}`);
-      setClasses(response.data.data.classes);
+      const classesData = response.data.data?.classes || [];
+      console.log('Fetched classes from API:', classesData);
+
+      setClasses(classesData);
+      setCachedResult(cacheKey, classesData);
     } catch (error) {
       console.error('Error fetching classes:', error);
       message.error('Failed to load classes');
@@ -126,6 +175,7 @@ const Classes: React.FC = () => {
       setModalVisible(false);
       setEditingClass(null);
       form.resetFields();
+      clearCache(); // Clear cache when data changes
       fetchClasses();
     } catch (error: any) {
       console.error('Error saving class:', error);
@@ -138,6 +188,7 @@ const Classes: React.FC = () => {
     try {
       await axios.delete(`/api/classes/${id}`);
       message.success('Class deleted successfully');
+      clearCache(); // Clear cache when data changes
       fetchClasses();
     } catch (error: any) {
       console.error('Error deleting class:', error);
@@ -151,8 +202,9 @@ const Classes: React.FC = () => {
       if (selectedClass) {
         await axios.post(`/api/classes/${selectedClass.id}/schedules`, values);
         message.success('Schedule added successfully');
-        setScheduleModalVisible(false);
+        setAddScheduleModalVisible(false);
         scheduleForm.resetFields();
+        clearCache(); // Clear cache when schedule data changes
         fetchClassDetails(selectedClass.id);
       }
     } catch (error: any) {
@@ -167,6 +219,7 @@ const Classes: React.FC = () => {
       if (selectedClass) {
         await axios.delete(`/api/classes/${selectedClass.id}/schedules/${scheduleId}`);
         message.success('Schedule deleted successfully');
+        clearCache(); // Clear cache when schedule data changes
         fetchClassDetails(selectedClass.id);
       }
     } catch (error: any) {
@@ -361,7 +414,10 @@ const Classes: React.FC = () => {
           <Card>
             <Statistic
               title="Total Enrollment"
-              value={classes.reduce((acc, c) => acc + (c.enrolled_students || 0), 0)}
+              value={classes.reduce((acc, c) => {
+                const enrolled = c.enrolled_students;
+                return acc + (typeof enrolled === 'number' ? enrolled : 0);
+              }, 0)}
               prefix={<TeamOutlined />}
               valueStyle={{ color: '#3f8600' }}
             />
@@ -478,16 +534,6 @@ const Classes: React.FC = () => {
             <Input placeholder="Enter class name" />
           </Form.Item>
 
-          <Form.Item
-            name="subject"
-            label="Subject"
-          >
-            <Select placeholder="Select subject">
-              {subjects.map(subject => (
-                <Option key={subject} value={subject}>{subject}</Option>
-              ))}
-            </Select>
-          </Form.Item>
 
           <Form.Item
             name="description"
@@ -579,11 +625,65 @@ const Classes: React.FC = () => {
               <Button
                 type="primary"
                 icon={<PlusOutlined />}
-                onClick={() => scheduleForm.resetFields()}
+                onClick={() => {
+                  scheduleForm.resetFields();
+                  setAddScheduleModalVisible(true);
+                }}
               >
                 Add Schedule
               </Button>
             </div>
+
+            <Form
+              form={scheduleForm}
+              layout="vertical"
+              onFinish={handleScheduleSubmit}
+              style={{ marginBottom: 16 }}
+            >
+              <Row gutter={16}>
+                <Col span={8}>
+                  <Form.Item
+                    name="day_of_week"
+                    label="Day of Week"
+                    rules={[{ required: true, message: 'Please select day' }]}
+                  >
+                    <Select placeholder="Select day">
+                      {daysOfWeek.map(day => (
+                        <Option key={day.value} value={day.value}>{day.label}</Option>
+                      ))}
+                    </Select>
+                  </Form.Item>
+                </Col>
+                <Col span={8}>
+                  <Form.Item
+                    name="start_time"
+                    label="Start Time"
+                    rules={[{ required: true, message: 'Please select start time' }]}
+                  >
+                    <Input placeholder="09:00" />
+                  </Form.Item>
+                </Col>
+                <Col span={8}>
+                  <Form.Item
+                    name="end_time"
+                    label="End Time"
+                    rules={[{ required: true, message: 'Please select end time' }]}
+                  >
+                    <Input placeholder="10:30" />
+                  </Form.Item>
+                </Col>
+              </Row>
+              <Form.Item>
+                <Space>
+                  <Button type="primary" htmlType="submit">
+                    Add Schedule
+                  </Button>
+                  <Button onClick={() => scheduleForm.resetFields()}>
+                    Reset
+                  </Button>
+                </Space>
+              </Form.Item>
+            </Form>
 
             {selectedClassSchedules.length > 0 ? (
               <Table
@@ -631,6 +731,73 @@ const Classes: React.FC = () => {
             )}
           </TabPane>
         </Tabs>
+      </Modal>
+
+      {/* Add Schedule Modal */}
+      <Modal
+        title="Add Schedule"
+        open={addScheduleModalVisible}
+        onCancel={() => {
+          setAddScheduleModalVisible(false);
+          scheduleForm.resetFields();
+        }}
+        footer={null}
+        width={500}
+      >
+        <Form
+          form={scheduleForm}
+          layout="vertical"
+          onFinish={handleScheduleSubmit}
+        >
+          <Form.Item
+            name="day_of_week"
+            label="Day of Week"
+            rules={[{ required: true, message: 'Please select day' }]}
+          >
+            <Select placeholder="Select day">
+              {daysOfWeek.map(day => (
+                <Option key={day.value} value={day.value}>{day.label}</Option>
+              ))}
+            </Select>
+          </Form.Item>
+
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item
+                name="start_time"
+                label="Start Time"
+                rules={[{ required: true, message: 'Please enter start time' }]}
+              >
+                <Input placeholder="09:00" />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item
+                name="end_time"
+                label="End Time"
+                rules={[{ required: true, message: 'Please enter end time' }]}
+              >
+                <Input placeholder="10:30" />
+              </Form.Item>
+            </Col>
+          </Row>
+
+          <Form.Item>
+            <Space>
+              <Button type="primary" htmlType="submit">
+                Add Schedule
+              </Button>
+              <Button
+                onClick={() => {
+                  setAddScheduleModalVisible(false);
+                  scheduleForm.resetFields();
+                }}
+              >
+                Cancel
+              </Button>
+            </Space>
+          </Form.Item>
+        </Form>
       </Modal>
     </div>
   );

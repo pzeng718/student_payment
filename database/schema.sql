@@ -68,9 +68,21 @@ CREATE TABLE class_occurrences (
     actual_duration_minutes INTEGER,
     notes TEXT,
     was_cancelled BOOLEAN DEFAULT false,
+    is_auto_created BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(class_id, occurrence_date, start_time) -- Prevent duplicate occurrences
+);
+
+-- Student exclusions from class occurrences
+CREATE TABLE occurrence_exclusions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    occurrence_id UUID NOT NULL REFERENCES class_occurrences(id) ON DELETE CASCADE,
+    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(occurrence_id, student_id) -- One exclusion per student per occurrence
 );
 
 -- Student attendance tracking
@@ -86,11 +98,9 @@ CREATE TABLE student_attendance (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(student_id, class_occurrence_id) -- One attendance record per student per occurrence
 );
-
 -- Payment types enum
 CREATE TYPE payment_method AS ENUM ('wechat', 'cash', 'zelle', 'paypal', 'credit_card', 'bank_transfer');
 
--- Payments table
 CREATE TABLE payments (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
@@ -103,6 +113,21 @@ CREATE TABLE payments (
     notes TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+
+-- Payment deductions tracking (links attendance to payment usage)
+CREATE TABLE payment_deductions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    class_id UUID NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+    occurrence_id UUID NOT NULL REFERENCES class_occurrences(id) ON DELETE CASCADE,
+    payment_id UUID REFERENCES payments(id) ON DELETE SET NULL,
+    classes_deducted INTEGER NOT NULL DEFAULT 1 CHECK (classes_deducted > 0),
+    deduction_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(student_id, occurrence_id) -- One deduction per student per occurrence
 );
 
 -- Payment class allocation (which classes the payment covers)
@@ -125,8 +150,15 @@ CREATE INDEX idx_student_enrollments_student_id ON student_class_enrollments(stu
 CREATE INDEX idx_student_enrollments_class_id ON student_class_enrollments(class_id);
 CREATE INDEX idx_class_occurrences_class_id ON class_occurrences(class_id);
 CREATE INDEX idx_class_occurrences_date ON class_occurrences(occurrence_date);
+CREATE INDEX idx_class_occurrences_auto_created ON class_occurrences(is_auto_created);
+CREATE INDEX idx_occurrence_exclusions_occurrence_id ON occurrence_exclusions(occurrence_id);
+CREATE INDEX idx_occurrence_exclusions_student_id ON occurrence_exclusions(student_id);
 CREATE INDEX idx_student_attendance_student_id ON student_attendance(student_id);
 CREATE INDEX idx_student_attendance_occurrence_id ON student_attendance(class_occurrence_id);
+CREATE INDEX idx_payment_deductions_student_id ON payment_deductions(student_id);
+CREATE INDEX idx_payment_deductions_class_id ON payment_deductions(class_id);
+CREATE INDEX idx_payment_deductions_occurrence_id ON payment_deductions(occurrence_id);
+CREATE INDEX idx_payment_deductions_payment_id ON payment_deductions(payment_id);
 CREATE INDEX idx_payments_student_id ON payments(student_id);
 CREATE INDEX idx_payments_date ON payments(payment_date);
 CREATE INDEX idx_payment_allocations_payment_id ON payment_class_allocations(payment_id);
@@ -150,6 +182,15 @@ CREATE TRIGGER update_class_schedules_updated_at BEFORE UPDATE ON class_schedule
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER update_class_occurrences_updated_at BEFORE UPDATE ON class_occurrences
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_occurrence_exclusions_updated_at BEFORE UPDATE ON occurrence_exclusions
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_student_attendance_updated_at BEFORE UPDATE ON student_attendance
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_payment_deductions_updated_at BEFORE UPDATE ON payment_deductions
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER update_payments_updated_at BEFORE UPDATE ON payments
@@ -178,10 +219,9 @@ SELECT
 FROM students s
 LEFT JOIN payments p ON s.id = p.student_id
 LEFT JOIN (
-    SELECT sa.student_id, COUNT(*) as classes_attended
-    FROM student_attendance sa
-    WHERE sa.attendance_status = 'present'
-    GROUP BY sa.student_id
+    SELECT pd.student_id, SUM(pd.classes_deducted) as classes_attended
+    FROM payment_deductions pd
+    GROUP BY pd.student_id
 ) attended ON s.id = attended.student_id
 GROUP BY s.id, s.name, s.grade, attended.classes_attended;
 
@@ -221,41 +261,6 @@ WHERE p.payment_date >= CURRENT_DATE - INTERVAL '30 days'
 GROUP BY p.id, p.amount, p.classes_purchased, p.classes_remaining, p.payment_method, p.payment_date, s.name, s.grade
 ORDER BY p.payment_date DESC;
 
--- Insert some sample data for testing
-INSERT INTO students (name, email, grade, phone) VALUES
-('Alice Johnson', 'alice@example.com', 'Grade 10', '+1-555-0101'),
-('Bob Smith', 'bob@example.com', 'Grade 9', '+1-555-0102'),
-('Carol Williams', 'carol@example.com', 'Grade 11', '+1-555-0103');
-
-INSERT INTO classes (name, description, subject, duration_minutes, max_students, price_per_class) VALUES
-('Advanced Mathematics', 'Advanced math concepts and problem solving', 'Mathematics', 90, 15, 25.00),
-('English Literature', 'Classic and modern literature analysis', 'English', 60, 20, 20.00),
-('Physics Lab', 'Hands-on physics experiments', 'Physics', 120, 12, 35.00);
-
-INSERT INTO class_schedules (class_id, day_of_week, start_time, end_time) VALUES
-((SELECT id FROM classes WHERE name = 'Advanced Mathematics'), 1, '14:00', '15:30'), -- Monday
-((SELECT id FROM classes WHERE name = 'Advanced Mathematics'), 3, '14:00', '15:30'), -- Wednesday
-((SELECT id FROM classes WHERE name = 'English Literature'), 2, '10:00', '11:00'), -- Tuesday
-((SELECT id FROM classes WHERE name = 'English Literature'), 4, '10:00', '11:00'), -- Thursday
-((SELECT id FROM classes WHERE name = 'Physics Lab'), 5, '13:00', '15:00'); -- Friday
-
-INSERT INTO student_class_enrollments (student_id, class_id) VALUES
-((SELECT id FROM students WHERE name = 'Alice Johnson'), (SELECT id FROM classes WHERE name = 'Advanced Mathematics')),
-((SELECT id FROM students WHERE name = 'Alice Johnson'), (SELECT id FROM classes WHERE name = 'English Literature')),
-((SELECT id FROM students WHERE name = 'Bob Smith'), (SELECT id FROM classes WHERE name = 'Advanced Mathematics')),
-((SELECT id FROM students WHERE name = 'Carol Williams'), (SELECT id FROM classes WHERE name = 'Physics Lab'));
-
-INSERT INTO payments (student_id, payment_method, amount, classes_purchased, classes_remaining, payment_reference) VALUES
-((SELECT id FROM students WHERE name = 'Alice Johnson'), 'wechat', 250.00, 10, 10, 'WX2025001'),
-((SELECT id FROM students WHERE name = 'Bob Smith'), 'cash', 125.00, 5, 5, 'CASH2025001'),
-((SELECT id FROM students WHERE name = 'Carol Williams'), 'zelle', 350.00, 10, 10, 'ZELLE2025001');
-
-INSERT INTO payment_class_allocations (payment_id, class_id, classes_allocated) VALUES
-((SELECT id FROM payments WHERE payment_reference = 'WX2025001'),
- (SELECT id FROM classes WHERE name = 'Advanced Mathematics'), 6),
-((SELECT id FROM payments WHERE payment_reference = 'WX2025001'),
- (SELECT id FROM classes WHERE name = 'English Literature'), 4),
-((SELECT id FROM payments WHERE payment_reference = 'CASH2025001'),
- (SELECT id FROM classes WHERE name = 'Advanced Mathematics'), 5),
-((SELECT id FROM payments WHERE payment_reference = 'ZELLE2025001'),
- (SELECT id FROM classes WHERE name = 'Physics Lab'), 10);
+-- Additional indexes for better performance
+CREATE INDEX idx_payments_student_enrolled_classes ON payments(student_id);
+CREATE INDEX idx_payment_allocations_enrollment_check ON payment_class_allocations(payment_id, class_id);

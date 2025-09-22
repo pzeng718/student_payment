@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Typography, Table, Button, Space, Modal, Form, Input, Select,
   Popconfirm, message, Tag, Card, Statistic, Row, Col, Progress,
@@ -71,20 +71,69 @@ const Payments: React.FC = () => {
   const [editingPayment, setEditingPayment] = useState<Payment | null>(null);
   const [allocationModalVisible, setAllocationModalVisible] = useState(false);
   const [selectedPayment, setSelectedPayment] = useState<Payment | null>(null);
+  const [selectedStudentClasses, setSelectedStudentClasses] = useState<Class[]>([]);
   const [searchText, setSearchText] = useState('');
   const [methodFilter, setMethodFilter] = useState<string | undefined>();
   const [form] = Form.useForm();
   const [allocationForm] = Form.useForm();
 
+  // Search caching
+  const searchCache = useRef<Map<string, { data: Payment[], timestamp: number }>>(new Map());
+  const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+  const generateCacheKey = useCallback((search: string, method: string | undefined) => {
+    return `${search || ''}_${method || 'all'}`;
+  }, []);
+
+  const getCachedResult = useCallback((key: string) => {
+    const cached = searchCache.current.get(key);
+    if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+      return cached.data;
+    }
+    return null;
+  }, []);
+
+  const setCachedResult = useCallback((key: string, data: Payment[]) => {
+    searchCache.current.set(key, {
+      data: [...data],
+      timestamp: Date.now()
+    });
+
+    // Limit cache size to prevent memory issues
+    if (searchCache.current.size > 20) {
+      const firstKey = searchCache.current.keys().next().value;
+      searchCache.current.delete(firstKey);
+    }
+  }, []);
+
+  const clearCache = useCallback(() => {
+    searchCache.current.clear();
+  }, []);
+
   const fetchPayments = async () => {
     try {
       setLoading(true);
+
+      const cacheKey = generateCacheKey(searchText, methodFilter);
+      const cachedData = getCachedResult(cacheKey);
+
+      if (cachedData) {
+        console.log('Using cached payments data');
+        setPayments(cachedData);
+        setLoading(false);
+        return;
+      }
+
       const params: any = {};
       if (searchText) params.search = searchText;
       if (methodFilter) params.method = methodFilter;
 
       const response = await axios.get('/api/payments', { params });
-      setPayments(response.data.payments || []);
+      const paymentsData = response.data.data?.payments || [];
+      console.log('Fetched payments from API:', paymentsData);
+
+      setPayments(paymentsData);
+      setCachedResult(cacheKey, paymentsData);
     } catch (error: any) {
       console.error('Error fetching payments:', error);
       message.error(error.response?.data?.message || 'Failed to fetch payments');
@@ -117,6 +166,17 @@ const Payments: React.FC = () => {
     }
   };
 
+  const fetchStudentClasses = async (studentId: string) => {
+    try {
+      const response = await axios.get(`/api/students/${studentId}/classes`);
+      const enrolledClasses = response.data.data || [];
+      setSelectedStudentClasses(enrolledClasses);
+    } catch (error: any) {
+      console.error('Error fetching student classes:', error);
+      setSelectedStudentClasses([]);
+    }
+  };
+
   useEffect(() => {
     fetchPayments();
     fetchStudents();
@@ -125,16 +185,36 @@ const Payments: React.FC = () => {
 
   const handleSubmit = async (values: any) => {
     try {
+      // Prepare class allocations from form data
+      const classAllocations = [];
+      if (values.class_allocations) {
+        for (const allocation of values.class_allocations) {
+          if (allocation.class_id && allocation.allocated_classes > 0) {
+            classAllocations.push({
+              class_id: allocation.class_id,
+              allocated_classes: allocation.allocated_classes
+            });
+          }
+        }
+      }
+
+      const paymentData = {
+        ...values,
+        class_allocations: classAllocations.length > 0 ? classAllocations : undefined
+      };
+
       if (editingPayment) {
-        await axios.put(`/api/payments/${editingPayment.id}`, values);
+        await axios.put(`/api/payments/${editingPayment.id}`, paymentData);
         message.success('Payment updated successfully');
       } else {
-        await axios.post('/api/payments', values);
+        await axios.post('/api/payments', paymentData);
         message.success('Payment created successfully');
       }
       setModalVisible(false);
       setEditingPayment(null);
+      setSelectedStudentClasses([]);
       form.resetFields();
+      clearCache(); // Clear cache when data changes
       fetchPayments();
     } catch (error: any) {
       console.error('Error saving payment:', error);
@@ -142,10 +222,19 @@ const Payments: React.FC = () => {
     }
   };
 
+  const handleStudentChange = (studentId: string) => {
+    if (studentId) {
+      fetchStudentClasses(studentId);
+    } else {
+      setSelectedStudentClasses([]);
+    }
+  };
+
   const handleDelete = async (id: string) => {
     try {
       await axios.delete(`/api/payments/${id}`);
       message.success('Payment deleted successfully');
+      clearCache(); // Clear cache when data changes
       fetchPayments();
     } catch (error: any) {
       console.error('Error deleting payment:', error);
@@ -347,6 +436,7 @@ const Payments: React.FC = () => {
             icon={<PlusOutlined />}
             onClick={() => {
               setEditingPayment(null);
+              setSelectedStudentClasses([]);
               form.resetFields();
               setModalVisible(true);
             }}
@@ -377,6 +467,7 @@ const Payments: React.FC = () => {
         onCancel={() => {
           setModalVisible(false);
           setEditingPayment(null);
+          setSelectedStudentClasses([]);
           form.resetFields();
         }}
         footer={null}
@@ -397,6 +488,7 @@ const Payments: React.FC = () => {
               disabled={students.length === 0}
               showSearch
               optionFilterProp="children"
+              onChange={handleStudentChange}
             >
               {students.map(student => (
                 <Option key={student.id} value={student.id}>
@@ -457,6 +549,83 @@ const Payments: React.FC = () => {
             <Input placeholder="Transaction ID or reference number" />
           </Form.Item>
 
+          {/* Class Allocation Section */}
+          {selectedStudentClasses.length > 0 && (
+            <div style={{ marginBottom: 16, padding: 16, border: '1px solid #f0f0f0', borderRadius: 8 }}>
+              <Text strong style={{ marginBottom: 16, display: 'block' }}>
+                Allocate Classes (Optional)
+              </Text>
+              <Text type="secondary" style={{ marginBottom: 16, display: 'block' }}>
+                Specify how many classes from this payment should be allocated to each enrolled class.
+                Total allocated classes cannot exceed {form.getFieldValue('classes_purchased') || 0}.
+              </Text>
+
+              <Form.List name="class_allocations">
+                {(fields, { add, remove }) => (
+                  <>
+                    {fields.map((field, index) => (
+                      <div key={field.key} style={{ marginBottom: 16, padding: 12, border: '1px solid #d9d9d9', borderRadius: 4 }}>
+                        <Row gutter={16} align="middle">
+                          <Col span={12}>
+                            <Form.Item
+                              {...field}
+                              name={[field.name, 'class_id']}
+                              rules={[{ required: true, message: 'Please select class' }]}
+                              style={{ marginBottom: 8 }}
+                            >
+                              <Select placeholder="Select class">
+                                {selectedStudentClasses.map(cls => (
+                                  <Option key={cls.id} value={cls.id}>
+                                    {cls.name} - {cls.subject}
+                                  </Option>
+                                ))}
+                              </Select>
+                            </Form.Item>
+                          </Col>
+                          <Col span={8}>
+                            <Form.Item
+                              {...field}
+                              name={[field.name, 'allocated_classes']}
+                              rules={[{ required: true, message: 'Enter number of classes' }]}
+                              style={{ marginBottom: 8 }}
+                            >
+                              <InputNumber
+                                placeholder="Classes"
+                                min={1}
+                                style={{ width: '100%' }}
+                              />
+                            </Form.Item>
+                          </Col>
+                          <Col span={4}>
+                            <Button
+                              type="link"
+                              danger
+                              onClick={() => remove(field.name)}
+                              style={{ padding: 0 }}
+                            >
+                              Remove
+                            </Button>
+                          </Col>
+                        </Row>
+                      </div>
+                    ))}
+                    <Form.Item>
+                      <Button
+                        type="dashed"
+                        onClick={() => add()}
+                        block
+                        icon={<PlusOutlined />}
+                        disabled={fields.length >= selectedStudentClasses.length}
+                      >
+                        Add Class Allocation
+                      </Button>
+                    </Form.Item>
+                  </>
+                )}
+              </Form.List>
+            </div>
+          )}
+
           <Form.Item
             name="notes"
             label="Notes"
@@ -473,6 +642,7 @@ const Payments: React.FC = () => {
                 onClick={() => {
                   setModalVisible(false);
                   setEditingPayment(null);
+                  setSelectedStudentClasses([]);
                   form.resetFields();
                 }}
               >

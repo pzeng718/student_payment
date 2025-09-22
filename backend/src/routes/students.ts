@@ -46,15 +46,43 @@ router.get('/', async (req, res, next) => {
     const countResult = await query(countQuery, params.slice(0, paramCount));
     const total = parseInt(countResult.rows[0].count);
 
-    // Get students
+    // Get students with enrollment count
     paramCount++;
+
+    // Handle WHERE clause properly for joined query
+    let finalWhereClause = whereClause;
+    if (search || grade) {
+      // If there are filters, prefix column references with 's.'
+      // Replace column names that appear before operators
+      finalWhereClause = whereClause
+        .replace(/WHERE (name)/g, 'WHERE s.$1')
+        .replace(/WHERE (email)/g, 'WHERE s.$1')
+        .replace(/WHERE (grade)/g, 'WHERE s.$1')
+        .replace(/ AND (name)/g, ' AND s.$1')
+        .replace(/ AND (email)/g, ' AND s.$1')
+        .replace(/ AND (grade)/g, ' AND s.$1')
+        .replace(/ OR (name)/g, ' OR s.$1')
+        .replace(/ OR (email)/g, ' OR s.$1')
+        .replace(/ OR (grade)/g, ' OR s.$1');
+    }
+    // If no filters (whereClause is "WHERE 1=1"), keep it as is
+
     const studentsQuery = `
       SELECT
-        id, name, email, grade, phone, emergency_contact, emergency_phone, notes,
-        created_at, updated_at
-      FROM students
-      ${whereClause}
-      ORDER BY name
+        s.id, s.name, s.email, s.grade, s.phone, s.emergency_contact, s.emergency_phone, s.notes,
+        s.created_at, s.updated_at,
+        COUNT(DISTINCT sce.class_id) as enrolled_classes_count,
+        COALESCE(sb.total_classes_purchased, 0) as total_classes_purchased,
+        COALESCE(sb.total_classes_remaining, 0) as total_classes_remaining,
+        COALESCE(sb.classes_attended, 0) as classes_attended,
+        COALESCE(sb.classes_used, 0) as classes_used,
+        sb.attendance_percentage
+      FROM students s
+      LEFT JOIN student_class_enrollments sce ON s.id = sce.student_id AND sce.is_active = true
+      LEFT JOIN student_balances sb ON s.id = sb.student_id
+      ${finalWhereClause}
+      GROUP BY s.id, s.name, s.email, s.grade, s.phone, s.emergency_contact, s.emergency_phone, s.notes, s.created_at, s.updated_at, sb.total_classes_purchased, sb.total_classes_remaining, sb.classes_attended, sb.classes_used, sb.attendance_percentage
+      ORDER BY s.name
       LIMIT $${paramCount} OFFSET $${paramCount + 1}
     `;
     params.push(limit, offset);
@@ -244,6 +272,52 @@ router.get('/:id/classes', studentIdValidation, async (req, res, next) => {
   }
 });
 
+// Get student's per-class balances
+router.get('/:id/balances', studentIdValidation, async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    const { id } = req.params;
+
+    const queryStr = `
+      SELECT
+        c.id as class_id,
+        c.name as class_name,
+        c.subject,
+        COALESCE(SUM(pca.classes_allocated), 0) as classes_purchased,
+        COALESCE(SUM(pca.classes_allocated), 0) - COUNT(DISTINCT pd.id) as classes_remaining,
+        COUNT(DISTINCT pd.id) as classes_used,
+        COUNT(DISTINCT sa.id) as classes_attended
+      FROM student_class_enrollments sce
+      JOIN classes c ON sce.class_id = c.id
+      LEFT JOIN payments p ON p.student_id = sce.student_id
+      LEFT JOIN payment_class_allocations pca ON pca.payment_id = p.id AND pca.class_id = c.id
+      LEFT JOIN payment_deductions pd ON pd.class_id = c.id
+        AND pd.student_id = sce.student_id
+      LEFT JOIN student_attendance sa ON sa.class_occurrence_id IN (
+        SELECT co.id FROM class_occurrences co WHERE co.class_id = c.id
+      ) AND sa.student_id = sce.student_id AND sa.attendance_status = 'present'
+      WHERE sce.student_id = $1 AND sce.is_active = true
+      GROUP BY c.id, c.name, c.subject
+      ORDER BY c.name
+    `;
+
+    const result = await query(queryStr, [id]);
+
+    res.json({
+      success: true,
+      data: {
+        balances: result.rows
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Enroll student in class
 router.post('/:id/enroll/:classId', [studentIdValidation, param('classId').isUUID()], async (req, res, next) => {
   try {
@@ -264,6 +338,7 @@ router.post('/:id/enroll/:classId', [studentIdValidation, param('classId').isUUI
     `;
 
     await query(queryStr, [id, classId]);
+    console.log('Student enrolled in class successfully', id, classId);
 
     res.status(201).json({
       success: true,
