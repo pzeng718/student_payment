@@ -207,7 +207,8 @@ const Payments: React.FC = () => {
         await axios.put(`/api/payments/${editingPayment.id}`, paymentData);
         message.success('Payment updated successfully');
       } else {
-        await axios.post('/api/payments', paymentData);
+        const response = await axios.post('/api/payments', paymentData);
+        console.log('Payment creation response:', response.data);
         message.success('Payment created successfully');
       }
       setModalVisible(false);
@@ -246,7 +247,15 @@ const Payments: React.FC = () => {
     if (!selectedPayment) return;
 
     try {
-      await axios.post(`/api/payments/${selectedPayment.id}/allocate`, values);
+      // Transform the allocation data to match backend expectations
+      const allocationData = {
+        allocations: values.allocations.map((allocation: any) => ({
+          class_id: allocation.class_id,
+          allocated_classes: allocation.allocated_classes
+        }))
+      };
+
+      await axios.post(`/api/payments/${selectedPayment.id}/allocate`, allocationData);
       message.success('Payment allocated successfully');
       setAllocationModalVisible(false);
       setSelectedPayment(null);
@@ -349,8 +358,7 @@ const Payments: React.FC = () => {
       ),
     },
   ];
-
-  const totalRevenue = payments.reduce((sum, p) => sum + p.amount, 0);
+  const totalRevenue = payments.reduce((sum, p) => sum + parseFloat(p.amount.toString()), 0);
   const totalClassesPurchased = payments.reduce((sum, p) => sum + p.classes_purchased, 0);
   const totalClassesRemaining = payments.reduce((sum, p) => sum + p.classes_remaining, 0);
   const avgPaymentAmount = payments.length > 0 ? totalRevenue / payments.length : 0;

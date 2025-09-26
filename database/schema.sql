@@ -69,6 +69,7 @@ CREATE TABLE class_occurrences (
     notes TEXT,
     was_cancelled BOOLEAN DEFAULT false,
     is_auto_created BOOLEAN DEFAULT false,
+    is_overdue BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(class_id, occurrence_date, start_time) -- Prevent duplicate occurrences
@@ -125,6 +126,8 @@ CREATE TABLE payment_deductions (
     occurrence_id UUID NOT NULL REFERENCES class_occurrences(id) ON DELETE CASCADE,
     payment_id UUID REFERENCES payments(id) ON DELETE SET NULL,
     classes_deducted INTEGER NOT NULL DEFAULT 1 CHECK (classes_deducted > 0),
+    is_overdue_deduction BOOLEAN DEFAULT false,
+    overdue_amount DECIMAL(10,2) DEFAULT 0,
     deduction_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(student_id, occurrence_id) -- One deduction per student per occurrence
@@ -159,6 +162,8 @@ CREATE INDEX idx_payment_deductions_student_id ON payment_deductions(student_id)
 CREATE INDEX idx_payment_deductions_class_id ON payment_deductions(class_id);
 CREATE INDEX idx_payment_deductions_occurrence_id ON payment_deductions(occurrence_id);
 CREATE INDEX idx_payment_deductions_payment_id ON payment_deductions(payment_id);
+CREATE INDEX idx_class_occurrences_overdue ON class_occurrences(is_overdue);
+CREATE INDEX idx_payment_deductions_overdue ON payment_deductions(is_overdue_deduction);
 CREATE INDEX idx_payments_student_id ON payments(student_id);
 CREATE INDEX idx_payments_date ON payments(payment_date);
 CREATE INDEX idx_payment_allocations_payment_id ON payment_class_allocations(payment_id);
@@ -191,6 +196,9 @@ CREATE TRIGGER update_student_attendance_updated_at BEFORE UPDATE ON student_att
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER update_payment_deductions_updated_at BEFORE UPDATE ON payment_deductions
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_payment_class_allocations_updated_at BEFORE UPDATE ON payment_class_allocations
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER update_payments_updated_at BEFORE UPDATE ON payments

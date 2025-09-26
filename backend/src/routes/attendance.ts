@@ -1043,4 +1043,18 @@ router.get('/classes/:classId/stats', param('classId').isUUID(), async (req, res
   }
 });
 
+// Test endpoint to manually trigger scheduler
+router.post('/test-scheduler', async (req, res, next) => {
+  try {
+    const { testScheduler } = await import('../services/automatedScheduler');
+    await testScheduler();
+    res.json({
+      success: true,
+      message: 'Scheduler test completed successfully'
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default router;

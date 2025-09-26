@@ -203,10 +203,58 @@ router.post('/', paymentValidation, async (req, res, next) => {
     // If class allocations are provided, create them
     if (class_allocations && Array.isArray(class_allocations)) {
       for (const allocation of class_allocations) {
+        // Check for overdue occurrences for this class
+        const overdueQuery = `
+          SELECT co.id as occurrence_id, co.occurrence_date
+          FROM class_occurrences co
+          JOIN student_attendance sa ON co.id = sa.class_occurrence_id
+          WHERE sa.student_id = $1
+            AND co.class_id = $2
+            AND co.is_overdue = true
+            AND sa.attendance_status = 'present'
+          ORDER BY co.occurrence_date ASC
+          LIMIT $3
+        `;
+
+        const overdueOccurrences = await client.query(overdueQuery, [
+          student_id,
+          allocation.class_id,
+          allocation.allocated_classes
+        ]);
+
+        // Create payment allocation
         await client.query(
           'INSERT INTO payment_class_allocations (payment_id, class_id, classes_allocated) VALUES ($1, $2, $3)',
           [payment.id, allocation.class_id, allocation.allocated_classes]
         );
+
+        // Handle overdue deductions
+        if (overdueOccurrences.rows.length > 0) {
+          for (const overdue of overdueOccurrences.rows) {
+            // Check if deduction already exists
+            const existingDeduction = await client.query(
+              'SELECT id FROM payment_deductions WHERE student_id = $1 AND occurrence_id = $2',
+              [student_id, overdue.occurrence_id]
+            );
+
+            if (existingDeduction.rows.length === 0) {
+              // Create overdue deduction record
+              await client.query(`
+                INSERT INTO payment_deductions (student_id, class_id, occurrence_id, payment_id, classes_deducted, is_overdue_deduction)
+                VALUES ($1, $2, $3, $4, 1, true)
+              `, [student_id, allocation.class_id, overdue.occurrence_id, payment.id]);
+
+              // Remove overdue status
+              await client.query(`
+                UPDATE class_occurrences
+                SET is_overdue = false
+                WHERE id = $1
+              `, [overdue.occurrence_id]);
+
+              console.log(`✅ Overdue deduction created for occurrence ${overdue.occurrence_id} on ${overdue.occurrence_date}`);
+            }
+          }
+        }
       }
     }
 
