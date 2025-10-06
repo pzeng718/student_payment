@@ -2,58 +2,118 @@ import express from 'express';
 import { body, param, validationResult } from 'express-validator';
 import { query, getClient } from '../config/database';
 
-// Helper function to deduct payment balance for a student
+// Helper function to deduct payment balance for a student (includes overdue logic)
 async function deductPaymentBalance(client: any, studentId: string, classId: string, occurrenceId: string) {
-  // Check if deduction already exists for this occurrence to prevent double deduction
-  const existingDeduction = await client.query(
-    'SELECT id FROM payment_deductions WHERE student_id = $1 AND occurrence_id = $2',
-    [studentId, occurrenceId]
-  );
+  try {
+    // Check if deduction already exists for this occurrence to prevent double deduction
+    const existingDeduction = await client.query(
+      'SELECT id FROM payment_deductions WHERE student_id = $1 AND occurrence_id = $2',
+      [studentId, occurrenceId]
+    );
 
-  if (existingDeduction.rows.length > 0) {
-    // Already deducted for this occurrence, skip
-    return;
-  }
+    if (existingDeduction.rows.length > 0) {
+      return { success: false, reason: 'already_exists' };
+    }
 
-  // Find available payment for this student and class
-  const paymentQuery = `
-    SELECT
-      p.id,
-      pca.classes_allocated,
-      (pca.classes_allocated - COALESCE(used.classes_used, 0)) as available_classes
-    FROM payments p
-    JOIN payment_class_allocations pca ON p.id = pca.payment_id
-    LEFT JOIN (
-      SELECT pd.payment_id, SUM(pd.classes_deducted) as classes_used
-      FROM payment_deductions pd
-      WHERE pd.student_id = $1 AND pd.class_id = $2
-      GROUP BY pd.payment_id
-    ) used ON p.id = used.payment_id
-    WHERE p.student_id = $1
-      AND pca.class_id = $2
-      AND p.classes_remaining > 0
-      AND (pca.classes_allocated - COALESCE(used.classes_used, 0)) > 0
-    ORDER BY p.payment_date DESC
-    LIMIT 1
-  `;
+    // First, try to find available payment with remaining balance
+    const paymentQuery = `
+      SELECT
+        p.id,
+        p.classes_remaining,
+        pca.classes_allocated,
+        (pca.classes_allocated - COALESCE(used.classes_used, 0)) as available_classes,
+        p.payment_date,
+        c.price_per_class
+      FROM payments p
+      JOIN payment_class_allocations pca ON p.id = pca.payment_id
+      JOIN classes c ON c.id = pca.class_id
+      LEFT JOIN (
+        SELECT pd.payment_id, SUM(pd.classes_deducted) as classes_used
+        FROM payment_deductions pd
+        WHERE pd.student_id = $1 AND pd.class_id = $2
+        GROUP BY pd.payment_id
+      ) used ON p.id = used.payment_id
+      WHERE p.student_id = $1
+        AND pca.class_id = $2
+        AND p.classes_remaining > 0
+        AND (pca.classes_allocated - COALESCE(used.classes_used, 0)) > 0
+      ORDER BY p.payment_date DESC
+      LIMIT 1
+    `;
 
-  const paymentResult = await client.query(paymentQuery, [studentId, classId]);
+    const paymentResult = await client.query(paymentQuery, [studentId, classId]);
 
-  if (paymentResult.rows.length > 0) {
-    const payment = paymentResult.rows[0];
+    let payment = null;
+    let isOverdueDeduction = false;
 
-    // Create payment deduction record
-    await client.query(`
-      INSERT INTO payment_deductions (student_id, class_id, occurrence_id, payment_id, classes_deducted)
-      VALUES ($1, $2, $3, $4, 1)
-    `, [studentId, classId, occurrenceId, payment.id]);
+    if (paymentResult.rows.length === 0) {
+      // No payment available - create overdue deduction
+      isOverdueDeduction = true;
+      console.log(`  📝 Creating overdue deduction for student ${studentId} in class ${classId}`);
+    } else {
+      payment = paymentResult.rows[0];
+      const classPrice = parseFloat(payment.price_per_class || '0');
 
-    // Update payment remaining count
-    await client.query(`
-      UPDATE payments
-      SET classes_remaining = classes_remaining - 1
-      WHERE id = $1
-    `, [payment.id]);
+      // Double-check that we have classes remaining in this payment
+      if (payment.classes_remaining <= 0) {
+        isOverdueDeduction = true;
+        console.log(`  📝 Payment has no remaining classes - creating overdue deduction`);
+      } else {
+        const availableClasses = payment.classes_allocated - (payment.available_classes || 0);
+        if (availableClasses <= 0) {
+          isOverdueDeduction = true;
+          console.log(`  📝 No allocated classes available - creating overdue deduction`);
+        }
+      }
+    }
+
+    // Always create a deduction record
+    let deductionResult;
+    if (isOverdueDeduction) {
+      // Create overdue deduction (no payment_id)
+      deductionResult = await client.query(`
+        INSERT INTO payment_deductions (student_id, class_id, occurrence_id, classes_deducted, is_overdue_deduction)
+        VALUES ($1, $2, $3, 1, true)
+        RETURNING id
+      `, [studentId, classId, occurrenceId]);
+
+      // Mark occurrence as overdue
+      await client.query(`
+        UPDATE class_occurrences
+        SET is_overdue = true
+        WHERE id = $1
+      `, [occurrenceId]);
+
+      console.log(`  📝 Overdue deduction created: ${deductionResult.rows[0].id}`);
+      return { success: true, is_overdue: true, deduction_id: deductionResult.rows[0].id };
+    } else {
+      // Create normal deduction with payment
+      deductionResult = await client.query(`
+        INSERT INTO payment_deductions (student_id, class_id, occurrence_id, payment_id, classes_deducted)
+        VALUES ($1, $2, $3, $4, 1)
+        RETURNING id
+      `, [studentId, classId, occurrenceId, payment.id]);
+
+      // Update payment remaining count
+      await client.query(`
+        UPDATE payments
+        SET classes_remaining = classes_remaining - 1
+        WHERE id = $1
+      `, [payment.id]);
+
+      // Remove overdue status if it was set
+      await client.query(`
+        UPDATE class_occurrences
+        SET is_overdue = false
+        WHERE id = $1
+      `, [occurrenceId]);
+
+      console.log(`  📝 Normal deduction created: ${deductionResult.rows[0].id} using payment ${payment.id}`);
+      return { success: true, payment_id: payment.id, deduction_id: deductionResult.rows[0].id };
+    }
+
+  } catch (error: any) {
+    return { success: false, reason: 'error', error: error.message };
   }
 }
 
@@ -160,6 +220,9 @@ router.post('/occurrences', occurrenceValidation, async (req, res, next) => {
     const enrolledStudents = await client.query(enrolledStudentsQuery, [class_id, occurrence.id]);
 
     // Create attendance records and deduct payments
+    let processedCount = 0;
+    let skippedCount = 0;
+
     for (const student of enrolledStudents.rows) {
       // Create attendance record as 'present' by default
       await client.query(`
@@ -167,8 +230,20 @@ router.post('/occurrences', occurrenceValidation, async (req, res, next) => {
         VALUES ($1, $2, 'present')
       `, [student.student_id, occurrence.id]);
 
-      // Deduct payment balance
-      await deductPaymentBalance(client, student.student_id, class_id, occurrence.id);
+      // Deduct payment balance (includes overdue logic)
+      const deductionResult = await deductPaymentBalance(client, student.student_id, class_id, occurrence.id);
+
+      if (deductionResult.success) {
+        processedCount++;
+        console.log(`  ✅ Deducted balance for student ${student.student_id} in class ${class_id}`);
+      } else {
+        skippedCount++;
+        console.log(`  ⚠️  Skipped deduction for student ${student.student_id}: ${deductionResult.reason}`);
+      }
+    }
+
+    if (processedCount > 0) {
+      console.log(`✅ Manual occurrence: ${processedCount} students processed${skippedCount > 0 ? `, ${skippedCount} skipped` : ''}`);
     }
 
     await client.query('COMMIT');
@@ -176,7 +251,7 @@ router.post('/occurrences', occurrenceValidation, async (req, res, next) => {
     res.status(201).json({
       success: true,
       data: occurrence,
-      message: 'Class occurrence created successfully with attendance records'
+      message: `Class occurrence created successfully with ${processedCount} attendance records${skippedCount > 0 ? ` (${skippedCount} skipped)` : ''}`
     });
   } catch (error) {
     await client.query('ROLLBACK');

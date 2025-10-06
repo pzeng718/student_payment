@@ -69,21 +69,58 @@ router.get('/', async (req, res, next) => {
 
     const studentsQuery = `
       SELECT
-        s.id, s.name, s.email, s.grade, s.phone, s.emergency_contact, s.emergency_phone, s.notes,
-        s.created_at, s.updated_at,
-        COUNT(DISTINCT sce.class_id) as enrolled_classes_count,
-        COALESCE(sb.total_classes_purchased, 0) as total_classes_purchased,
-        COALESCE(sb.total_classes_remaining, 0) as total_classes_remaining,
-        COALESCE(sb.classes_attended, 0) as classes_attended,
-        COALESCE(sb.classes_used, 0) as classes_used,
-        sb.attendance_percentage
-      FROM students s
-      LEFT JOIN student_class_enrollments sce ON s.id = sce.student_id AND sce.is_active = true
-      LEFT JOIN student_balances sb ON s.id = sb.student_id
+        s.id,
+        s.name AS student_name,
+        s.email,
+        s.grade,
+        s.phone,
+        s.emergency_contact,
+        s.emergency_phone,
+        s.notes,
+        s.created_at,
+        s.updated_at,
+        COUNT(DISTINCT sce.class_id) AS enrolled_classes_count,
+        COALESCE(sb.total_classes_purchased, 0) AS total_classes_purchased,
+        COALESCE(sb.total_classes_remaining, 0) AS total_classes_remaining,
+        COALESCE(sb.classes_attended, 0) AS classes_attended,
+        COALESCE(sb.classes_used, 0) AS classes_used,
+        sb.attendance_percentage,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'class_id', c.id,
+              'class_name', c.name,
+              'subject', c.subject
+            )
+          ) FILTER (WHERE c.id IS NOT NULL),
+          '[]'::json
+        ) AS enrolled_classes
+      FROM students AS s
+      LEFT JOIN student_class_enrollments AS sce
+        ON s.id = sce.student_id AND sce.is_active = true
+      LEFT JOIN classes AS c
+        ON sce.class_id = c.id
+      LEFT JOIN student_balances AS sb
+        ON s.id = sb.student_id
       ${finalWhereClause}
-      GROUP BY s.id, s.name, s.email, s.grade, s.phone, s.emergency_contact, s.emergency_phone, s.notes, s.created_at, s.updated_at, sb.total_classes_purchased, sb.total_classes_remaining, sb.classes_attended, sb.classes_used, sb.attendance_percentage
+      GROUP BY
+        s.id,
+        s.name,
+        s.email,
+        s.grade,
+        s.phone,
+        s.emergency_contact,
+        s.emergency_phone,
+        s.notes,
+        s.created_at,
+        s.updated_at,
+        sb.total_classes_purchased,
+        sb.total_classes_remaining,
+        sb.classes_attended,
+        sb.classes_used,
+        sb.attendance_percentage
       ORDER BY s.name
-      LIMIT $${paramCount} OFFSET $${paramCount + 1}
+      LIMIT $${paramCount} OFFSET $${paramCount + 1};
     `;
     params.push(limit, offset);
 
@@ -156,7 +193,7 @@ router.post('/', studentValidation, async (req, res, next) => {
       return res.status(400).json({ success: false, errors: errors.array() });
     }
 
-    const { name, email, grade, phone, emergency_contact, emergency_phone, notes } = req.body;
+    const { name, email, grade, phone, emergency_contact, emergency_phone, notes, class_ids } = req.body;
 
     const queryStr = `
       INSERT INTO students (name, email, grade, phone, emergency_contact, emergency_phone, notes)
@@ -165,10 +202,33 @@ router.post('/', studentValidation, async (req, res, next) => {
     `;
 
     const result = await query(queryStr, [name, email, grade, phone, emergency_contact, emergency_phone, notes]);
+    const student = result.rows[0];
+
+    // Enroll student in specified classes if provided
+    if (class_ids && Array.isArray(class_ids) && class_ids.length > 0) {
+      for (const classId of class_ids) {
+        try {
+          // Check if already enrolled
+          const existingEnrollment = await query(
+            'SELECT id FROM student_class_enrollments WHERE student_id = $1 AND class_id = $2',
+            [student.id, classId]
+          );
+
+          if (existingEnrollment.rows.length === 0) {
+            await query(
+              'INSERT INTO student_class_enrollments (student_id, class_id) VALUES ($1, $2)',
+              [student.id, classId]
+            );
+          }
+        } catch (enrollError) {
+          console.warn(`Failed to enroll student ${student.id} in class ${classId}:`, enrollError);
+        }
+      }
+    }
 
     res.status(201).json({
       success: true,
-      data: result.rows[0],
+      data: student,
       message: 'Student created successfully'
     });
   } catch (error) {
@@ -185,7 +245,7 @@ router.put('/:id', [...studentIdValidation, ...studentValidation], async (req, r
     }
 
     const { id } = req.params;
-    const { name, email, grade, phone, emergency_contact, emergency_phone, notes } = req.body;
+    const { name, email, grade, phone, emergency_contact, emergency_phone, notes, class_ids } = req.body;
 
     const queryStr = `
       UPDATE students
@@ -195,6 +255,54 @@ router.put('/:id', [...studentIdValidation, ...studentValidation], async (req, r
     `;
 
     const result = await query(queryStr, [name, email, grade, phone, emergency_contact, emergency_phone, notes, id]);
+
+    // Handle class enrollment changes if class_ids provided
+    if (class_ids !== undefined && Array.isArray(class_ids)) {
+      // First, get current enrollments
+      const currentEnrollments = await query(
+        'SELECT class_id FROM student_class_enrollments WHERE student_id = $1 AND is_active = true',
+        [id]
+      );
+
+      const currentClassIds = currentEnrollments.rows.map(row => row.class_id);
+
+      // Find classes to add (in new list but not in current)
+      const classesToAdd = class_ids.filter((classId: string) => !currentClassIds.includes(classId));
+
+      // Find classes to remove (in current but not in new list)
+      const classesToRemove = currentClassIds.filter((classId: string) => !class_ids.includes(classId));
+
+      // Add new enrollments
+      for (const classId of classesToAdd) {
+        try {
+          const existingCheck = await query(
+            'SELECT id FROM student_class_enrollments WHERE student_id = $1 AND class_id = $2',
+            [id, classId]
+          );
+
+          if (existingCheck.rows.length === 0) {
+            await query(
+              'INSERT INTO student_class_enrollments (student_id, class_id) VALUES ($1, $2)',
+              [id, classId]
+            );
+          }
+        } catch (enrollError) {
+          console.warn(`Failed to enroll student ${id} in class ${classId}:`, enrollError);
+        }
+      }
+
+      // Remove old enrollments (soft delete by setting is_active = false)
+      for (const classId of classesToRemove) {
+        try {
+          await query(
+            'UPDATE student_class_enrollments SET is_active = false WHERE student_id = $1 AND class_id = $2',
+            [id, classId]
+          );
+        } catch (unenrollError) {
+          console.warn(`Failed to unenroll student ${id} from class ${classId}:`, unenrollError);
+        }
+      }
+    }
 
     if (result.rows.length === 0) {
       return res.status(404).json({
@@ -284,25 +392,15 @@ router.get('/:id/balances', studentIdValidation, async (req, res, next) => {
 
     const queryStr = `
       SELECT
-        c.id as class_id,
-        c.name as class_name,
-        c.subject,
-        COALESCE(SUM(pca.classes_allocated), 0) as classes_purchased,
-        COALESCE(SUM(pca.classes_allocated), 0) - COUNT(DISTINCT pd.id) as classes_remaining,
-        COUNT(DISTINCT pd.id) as classes_used,
-        COUNT(DISTINCT sa.id) as classes_attended
-      FROM student_class_enrollments sce
-      JOIN classes c ON sce.class_id = c.id
-      LEFT JOIN payments p ON p.student_id = sce.student_id
-      LEFT JOIN payment_class_allocations pca ON pca.payment_id = p.id AND pca.class_id = c.id
-      LEFT JOIN payment_deductions pd ON pd.class_id = c.id
-        AND pd.student_id = sce.student_id
-      LEFT JOIN student_attendance sa ON sa.class_occurrence_id IN (
-        SELECT co.id FROM class_occurrences co WHERE co.class_id = c.id
-      ) AND sa.student_id = sce.student_id AND sa.attendance_status = 'present'
-      WHERE sce.student_id = $1 AND sce.is_active = true
-      GROUP BY c.id, c.name, c.subject
-      ORDER BY c.name
+        scb.class_id,
+        scb.class_name,
+        scb.subject,
+        scb.classes_purchased,
+        scb.classes_remaining,
+        scb.classes_used,
+        scb.attendance_percentage
+      FROM student_class_balances scb
+      WHERE scb.student_id = $1
     `;
 
     const result = await query(queryStr, [id]);

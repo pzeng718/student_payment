@@ -122,6 +122,12 @@ const Attendance: React.FC = () => {
   const [scheduledClasses, setScheduledClasses] = useState<ScheduledClass[]>([]);
   const [selectedView, setSelectedView] = useState<'month' | 'day'>('month');
 
+  // State for tracking pending attendance changes
+  const [pendingAttendanceChanges, setPendingAttendanceChanges] = useState<{
+    [key: string]: { status: string; updatePayment: boolean; notes?: string }
+  }>({});
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+
   // Search caching
   const searchCache = useRef<Map<string, { data: ClassOccurrence[], timestamp: number }>>(new Map());
   const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
@@ -277,8 +283,8 @@ const Attendance: React.FC = () => {
         }))
       };
 
-      await axios.post('/api/attendance/occurrences', payload);
-      message.success('Class occurrence created successfully with automatic attendance and payment deduction');
+      const response = await axios.post('/api/attendance/occurrences', payload);
+      message.success(response.data.message || 'Class occurrence created successfully');
       setModalVisible(false);
       setExclusionModalVisible(false);
       form.resetFields();
@@ -325,6 +331,9 @@ const Attendance: React.FC = () => {
   };
 
   const showOccurrenceModal = async (occurrence: ClassOccurrence) => {
+    // Clear any existing pending changes when switching occurrences
+    setPendingAttendanceChanges({});
+    setHasUnsavedChanges(false);
     setSelectedOccurrence(occurrence);
     await fetchAttendanceForOccurrence(occurrence.id);
     setOccurrenceModalVisible(true);
@@ -342,6 +351,93 @@ const Attendance: React.FC = () => {
 
   const handleExclusionChange = (targetKeys: Key[], direction: TransferDirection, moveKeys: Key[]) => {
     setExcludedStudents(targetKeys);
+  };
+
+  // Helper functions for pending attendance changes
+  const getPendingChangeKey = (studentId: string) => `attendance-${selectedOccurrence?.id}-${studentId}`;
+
+  const handlePendingStatusChange = (studentId: string, newStatus: string) => {
+    const key = getPendingChangeKey(studentId);
+    setPendingAttendanceChanges(prev => ({
+      ...prev,
+      [key]: {
+        ...prev[key],
+        status: newStatus
+      }
+    }));
+    setHasUnsavedChanges(true);
+  };
+
+  const handlePendingPaymentChange = (studentId: string, updatePayment: boolean) => {
+    const key = getPendingChangeKey(studentId);
+    setPendingAttendanceChanges(prev => ({
+      ...prev,
+      [key]: {
+        ...prev[key],
+        updatePayment
+      }
+    }));
+    setHasUnsavedChanges(true);
+  };
+
+  const savePendingChanges = async () => {
+    if (!selectedOccurrence) return;
+
+    try {
+      const changesToSave = Object.entries(pendingAttendanceChanges)
+        .filter(([key]) => key.startsWith(`attendance-${selectedOccurrence.id}-`));
+
+      for (const [key, change] of changesToSave) {
+        const studentId = key.split('-').pop();
+        if (!studentId) continue;
+
+        // Save the change based on whether it includes payment update
+        if (change.updatePayment) {
+          await handleUpdateAttendanceWithPayment(
+            selectedOccurrence.id,
+            studentId,
+            change.status,
+            true,
+            change.notes
+          );
+        } else {
+          await handleUpdateAttendance(
+            selectedOccurrence.id,
+            studentId,
+            change.status,
+            change.notes
+          );
+        }
+      }
+
+      // Clear pending changes after successful save
+      setPendingAttendanceChanges({});
+      setHasUnsavedChanges(false);
+      message.success('All attendance changes saved successfully');
+    } catch (error) {
+      message.error('Failed to save some attendance changes');
+    }
+  };
+
+  const cancelPendingChanges = () => {
+    setPendingAttendanceChanges({});
+    setHasUnsavedChanges(false);
+    message.info('Attendance changes cancelled');
+  };
+
+  const getCurrentStatus = (record: AttendanceRecord) => {
+    const key = getPendingChangeKey(record.student_id);
+    return pendingAttendanceChanges[key]?.status || record.attendance_status;
+  };
+
+  const getCurrentPaymentUpdate = (record: AttendanceRecord) => {
+    const key = getPendingChangeKey(record.student_id);
+    return pendingAttendanceChanges[key]?.updatePayment || false;
+  };
+
+  const hasPendingChangesForRecord = (record: AttendanceRecord) => {
+    const key = getPendingChangeKey(record.student_id);
+    return !!pendingAttendanceChanges[key];
   };
 
   const handleUpdateAttendanceWithPayment = async (occurrenceId: string, studentId: string, status: string, updatePayment: boolean, notes?: string) => {
@@ -469,11 +565,11 @@ const Attendance: React.FC = () => {
       key: 'attendance_percentage',
       render: (percentage: number, record: ClassOccurrence) => (
         <Space direction="vertical" size={0}>
-          <Text strong>{Number(percentage).toFixed(1)}%</Text>
+          <Text strong>{isNaN(percentage) || !isFinite(percentage) ? '0.0' : Number(percentage).toFixed(1)}%</Text>
           <Progress
-            percent={percentage}
+            percent={isNaN(percentage) || !isFinite(percentage) ? 0 : percentage}
             size="small"
-            status={percentage >= 90 ? 'success' : percentage >= 70 ? 'normal' : 'exception'}
+            status={(isNaN(percentage) || !isFinite(percentage) ? 0 : percentage) >= 90 ? 'success' : (isNaN(percentage) || !isFinite(percentage) ? 0 : percentage) >= 70 ? 'normal' : 'exception'}
             style={{ width: 80 }}
           />
         </Space>
@@ -568,35 +664,56 @@ const Attendance: React.FC = () => {
     {
       title: 'Actions',
       key: 'actions',
-      render: (_, record: AttendanceRecord) => (
-        <Space direction="vertical" size={0}>
-          <Select
-            value={record.attendance_status}
-            style={{ width: 120 }}
-            onChange={(value) => handleUpdateAttendance(
-              selectedOccurrence!.id,
-              record.student_id,
-              value
-            )}
-          >
-            {Object.entries(statusLabels).map(([key, label]) => (
-              <Option key={key} value={key}>{label}</Option>
-            ))}
-          </Select>
-          <Tooltip title="Update with payment balance changes">
-            <Checkbox
-              onChange={(e) => handleUpdateAttendanceWithPayment(
-                selectedOccurrence!.id,
-                record.student_id,
-                record.attendance_status,
-                e.target.checked
+      render: (_, record: AttendanceRecord) => {
+        const hasChanges = hasPendingChangesForRecord(record);
+        const currentStatus = getCurrentStatus(record);
+        const currentPaymentUpdate = getCurrentPaymentUpdate(record);
+
+        return (
+          <Space direction="vertical" size={0}>
+            <div style={{ position: 'relative' }}>
+              <Select
+                value={currentStatus}
+                style={{
+                  width: 120,
+                  border: hasChanges ? '2px solid #1890ff' : '1px solid #d9d9d9'
+                }}
+                onChange={(value) => handlePendingStatusChange(record.student_id, value)}
+              >
+                {Object.entries(statusLabels).map(([key, label]) => (
+                  <Option key={key} value={key}>{label}</Option>
+                ))}
+              </Select>
+              {hasChanges && (
+                <div style={{
+                  position: 'absolute',
+                  top: -8,
+                  right: -8,
+                  background: '#1890ff',
+                  color: 'white',
+                  borderRadius: '50%',
+                  width: 16,
+                  height: 16,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: '10px'
+                }}>
+                  *
+                </div>
               )}
-            >
-              Update Balance
-            </Checkbox>
-          </Tooltip>
-        </Space>
-      ),
+            </div>
+            <Tooltip title="Update with payment balance changes">
+              <Checkbox
+                checked={currentPaymentUpdate}
+                onChange={(e) => handlePendingPaymentChange(record.student_id, e.target.checked)}
+              >
+                Update Balance
+              </Checkbox>
+            </Tooltip>
+          </Space>
+        );
+      },
     },
   ];
 
@@ -605,7 +722,7 @@ const Attendance: React.FC = () => {
   const avgAttendanceRate = occurrences.length > 0
     ? occurrences.reduce((sum, o) => {
         const percentage = o.attendance_percentage;
-        return sum + (typeof percentage === 'number' && !isNaN(percentage) ? percentage : 0);
+        return sum + (typeof percentage === 'number' && !isNaN(percentage) && isFinite(percentage) ? percentage : 0);
       }, 0) / occurrences.length
     : 0;
 
@@ -644,7 +761,7 @@ const Attendance: React.FC = () => {
                     }
                   />
                   <div style={{ fontSize: '9px', color: '#999', marginLeft: '14px' }}>
-                    {item.start_time} - {item.attendance_percentage.toFixed(0)}% attendance
+                    {item.start_time} - {isNaN(item.attendance_percentage) || !isFinite(item.attendance_percentage) ? '0' : item.attendance_percentage.toFixed(0)}% attendance
                   </div>
                 </li>
               ))}
@@ -799,10 +916,10 @@ const Attendance: React.FC = () => {
                                     </Text>
                                     <div style={{ marginTop: '4px' }}>
                                       <Progress
-                                        percent={occurrence.attendance_percentage}
+                                        percent={isNaN(occurrence.attendance_percentage) || !isFinite(occurrence.attendance_percentage) ? 0 : occurrence.attendance_percentage}
                                         size="small"
                                         status={occurrence.is_cancelled ? 'exception' : 'success'}
-                                        format={(percent) => `${percent?.toFixed(0)}% attendance`}
+                                        format={(percent) => `${(percent || 0).toFixed(0)}% attendance`}
                                       />
                                     </div>
                                   </div>
@@ -1102,18 +1219,46 @@ const Attendance: React.FC = () => {
         title={`Attendance - ${selectedOccurrence?.class_name}`}
         open={occurrenceModalVisible}
         onCancel={() => {
-          setOccurrenceModalVisible(false);
-          setSelectedOccurrence(null);
-          setAttendanceRecords([]);
+          if (hasUnsavedChanges) {
+            Modal.confirm({
+              title: 'Unsaved Changes',
+              content: 'You have unsaved attendance changes. Are you sure you want to close without saving?',
+              onOk: () => {
+                setOccurrenceModalVisible(false);
+                setSelectedOccurrence(null);
+                setAttendanceRecords([]);
+                setPendingAttendanceChanges({});
+                setHasUnsavedChanges(false);
+              }
+            });
+          } else {
+            setOccurrenceModalVisible(false);
+            setSelectedOccurrence(null);
+            setAttendanceRecords([]);
+          }
         }}
         footer={[
           <Button key="add-exclusion" onClick={() => setExclusionModalVisible(true)}>
             Add Exclusion
           </Button>,
           <Button key="close" onClick={() => {
-            setOccurrenceModalVisible(false);
-            setSelectedOccurrence(null);
-            setAttendanceRecords([]);
+            if (hasUnsavedChanges) {
+              Modal.confirm({
+                title: 'Unsaved Changes',
+                content: 'You have unsaved attendance changes. Are you sure you want to close without saving?',
+                onOk: () => {
+                  setOccurrenceModalVisible(false);
+                  setSelectedOccurrence(null);
+                  setAttendanceRecords([]);
+                  setPendingAttendanceChanges({});
+                  setHasUnsavedChanges(false);
+                }
+              });
+            } else {
+              setOccurrenceModalVisible(false);
+              setSelectedOccurrence(null);
+              setAttendanceRecords([]);
+            }
           }}>
             Close
           </Button>
@@ -1163,6 +1308,33 @@ const Attendance: React.FC = () => {
               />
             </Col>
           </Row>
+        </div>
+
+        <div style={{ marginBottom: 16 }}>
+          <Space>
+            <Button
+              type="primary"
+              onClick={savePendingChanges}
+              disabled={!hasUnsavedChanges}
+              icon={<PlusOutlined />}
+            >
+              Save Changes ({Object.keys(pendingAttendanceChanges).filter(key =>
+                key.startsWith(`attendance-${selectedOccurrence?.id}-`)
+              ).length})
+            </Button>
+            <Button
+              onClick={cancelPendingChanges}
+              disabled={!hasUnsavedChanges}
+              icon={<DeleteOutlined />}
+            >
+              Cancel Changes
+            </Button>
+            {hasUnsavedChanges && (
+              <Text type="warning">
+                You have unsaved attendance changes
+              </Text>
+            )}
+          </Space>
         </div>
 
         <Table

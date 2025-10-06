@@ -179,8 +179,10 @@ async function checkAndCreateOccurrences() {
 
             if (deductionResult.success) {
               processedCount++;
+              console.log(`  ✅ Deducted balance for student ${student.student_name} (${student.student_id}) in class ${schedule.class_name}`);
             } else {
               skippedCount++;
+              console.log(`  ⚠️  Skipped deduction for student ${student.student_name}: ${deductionResult.reason}`);
             }
 
           } catch (studentError: any) {
@@ -224,7 +226,7 @@ async function deductPaymentBalance(client: any, studentId: string, classId: str
       return { success: false, reason: 'already_exists' };
     }
 
-    // Find available payment for this student and class
+    // First, try to find available payment with remaining balance
     const paymentQuery = `
       SELECT
         p.id,
@@ -252,66 +254,74 @@ async function deductPaymentBalance(client: any, studentId: string, classId: str
 
     const paymentResult = await client.query(paymentQuery, [studentId, classId]);
 
+    let payment = null;
+    let isOverdueDeduction = false;
+
     if (paymentResult.rows.length === 0) {
-      // No payment available - mark occurrence as overdue for this student
+      // No payment available - create overdue deduction
+      isOverdueDeduction = true;
+      console.log(`  📝 Creating overdue deduction for student ${studentId} in class ${classId}`);
+    } else {
+      payment = paymentResult.rows[0];
+      const classPrice = parseFloat(payment.price_per_class || '0');
+
+      // Double-check that we have classes remaining in this payment
+      if (payment.classes_remaining <= 0) {
+        isOverdueDeduction = true;
+        console.log(`  📝 Payment has no remaining classes - creating overdue deduction`);
+      } else {
+        const availableClasses = payment.classes_allocated - (payment.available_classes || 0);
+        if (availableClasses <= 0) {
+          isOverdueDeduction = true;
+          console.log(`  📝 No allocated classes available - creating overdue deduction`);
+        }
+      }
+    }
+
+    // Always create a deduction record
+    let deductionResult;
+    if (isOverdueDeduction) {
+      // Create overdue deduction (no payment_id)
+      deductionResult = await client.query(`
+        INSERT INTO payment_deductions (student_id, class_id, occurrence_id, classes_deducted, is_overdue_deduction)
+        VALUES ($1, $2, $3, 1, true)
+        RETURNING id
+      `, [studentId, classId, occurrenceId]);
+
+      // Mark occurrence as overdue
       await client.query(`
         UPDATE class_occurrences
         SET is_overdue = true
         WHERE id = $1
       `, [occurrenceId]);
 
-      return { success: false, reason: 'no_payment_available_overdue' };
-    }
+      console.log(`  📝 Overdue deduction created: ${deductionResult.rows[0].id}`);
+      return { success: true, is_overdue: true, deduction_id: deductionResult.rows[0].id };
+    } else {
+      // Create normal deduction with payment
+      deductionResult = await client.query(`
+        INSERT INTO payment_deductions (student_id, class_id, occurrence_id, payment_id, classes_deducted)
+        VALUES ($1, $2, $3, $4, 1)
+        RETURNING id
+      `, [studentId, classId, occurrenceId, payment.id]);
 
-    const payment = paymentResult.rows[0];
-    const classPrice = parseFloat(payment.price_per_class || '0');
+      // Update payment remaining count
+      await client.query(`
+        UPDATE payments
+        SET classes_remaining = classes_remaining - 1
+        WHERE id = $1
+      `, [payment.id]);
 
-    // Double-check that we have classes remaining in this payment
-    if (payment.classes_remaining <= 0) {
-      // Mark as overdue
+      // Remove overdue status if it was set
       await client.query(`
         UPDATE class_occurrences
-        SET is_overdue = true
+        SET is_overdue = false
         WHERE id = $1
       `, [occurrenceId]);
 
-      return { success: false, reason: 'no_classes_remaining_overdue' };
+      console.log(`  📝 Normal deduction created: ${deductionResult.rows[0].id} using payment ${payment.id}`);
+      return { success: true, payment_id: payment.id, deduction_id: deductionResult.rows[0].id };
     }
-
-    const availableClasses = payment.classes_allocated - (payment.available_classes || 0);
-    if (availableClasses <= 0) {
-      // Mark as overdue
-      await client.query(`
-        UPDATE class_occurrences
-        SET is_overdue = true
-        WHERE id = $1
-      `, [occurrenceId]);
-
-      return { success: false, reason: 'no_allocated_classes_overdue' };
-    }
-
-    // Create payment deduction record
-    const deductionResult = await client.query(`
-      INSERT INTO payment_deductions (student_id, class_id, occurrence_id, payment_id, classes_deducted)
-      VALUES ($1, $2, $3, $4, 1)
-      RETURNING id
-    `, [studentId, classId, occurrenceId, payment.id]);
-
-    // Update payment remaining count
-    await client.query(`
-      UPDATE payments
-      SET classes_remaining = classes_remaining - 1
-      WHERE id = $1
-    `, [payment.id]);
-
-    // Remove overdue status if it was set
-    await client.query(`
-      UPDATE class_occurrences
-      SET is_overdue = false
-      WHERE id = $1
-    `, [occurrenceId]);
-
-    return { success: true, payment_id: payment.id, deduction_id: deductionResult.rows[0].id };
 
   } catch (error: any) {
     return { success: false, reason: 'error', error: error.message };

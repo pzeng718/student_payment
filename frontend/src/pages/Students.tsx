@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Typography, Table, Button, Space, Modal, Form, Input, Select,
-  Popconfirm, message, Tag, Card, Statistic, Row, Col, List
+  Popconfirm, message, Tag, Card, Statistic, Row, Col, List, Collapse
 } from 'antd';
 import {
   PlusOutlined, EditOutlined, DeleteOutlined, SearchOutlined,
@@ -16,7 +16,7 @@ const { TextArea } = Input;
 
 interface Student {
   id: string;
-  name: string;
+  student_name: string;
   email?: string;
   grade?: string;
   phone?: string;
@@ -27,10 +27,15 @@ interface Student {
   updated_at: string;
   total_classes_purchased?: number;
   total_classes_remaining?: number;
-  classes_attended?: number;
+  class_used?: number;
   classes_used?: number;
   attendance_percentage?: number;
   enrolled_classes_count?: number;
+  enrolled_classes?: Array<{
+    class_id: string;
+    class_name: string;
+    subject: string;
+  }>;
 }
 
 interface Class {
@@ -52,6 +57,7 @@ interface ClassBalance {
 
 const Students: React.FC = () => {
   const [students, setStudents] = useState<Student[]>([]);
+  const [groupedStudents, setGroupedStudents] = useState<{[className: string]: Student[]}>({});
   const [classes, setClasses] = useState<Class[]>([]);
   const [loading, setLoading] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
@@ -64,6 +70,7 @@ const Students: React.FC = () => {
   const [studentBalances, setStudentBalances] = useState<ClassBalance[]>([]);
   const [form] = Form.useForm();
   const [enrollmentForm] = Form.useForm();
+  const [selectedClasses, setSelectedClasses] = useState<string[]>([]);
 
   // Search caching
   const searchCache = useRef<Map<string, { data: Student[], timestamp: number }>>(new Map());
@@ -90,7 +97,9 @@ const Students: React.FC = () => {
     // Limit cache size to prevent memory issues
     if (searchCache.current.size > 20) {
       const firstKey = searchCache.current.keys().next().value;
-      searchCache.current.delete(firstKey);
+      if (firstKey) {
+        searchCache.current.delete(firstKey);
+      }
     }
   }, []);
 
@@ -123,6 +132,32 @@ const Students: React.FC = () => {
 
       setStudents(studentsData);
       setCachedResult(cacheKey, studentsData);
+
+      // Group students by their enrolled classes
+      const grouped: {[className: string]: Student[]} = {};
+      studentsData.forEach((student: Student) => {
+        if (student.enrolled_classes && student.enrolled_classes.length > 0) {
+          student.enrolled_classes.forEach((enrollment) => {
+            const className = enrollment.class_name;
+            if (!grouped[className]) {
+              grouped[className] = [];
+            }
+            // Check if student is already in this group to avoid duplicates
+            const exists = grouped[className].some(s => s.id === student.id);
+            if (!exists) {
+              grouped[className].push(student);
+            }
+          });
+        } else {
+          // Students with no classes go into "No Classes" group
+          if (!grouped['No Classes']) {
+            grouped['No Classes'] = [];
+          }
+          grouped['No Classes'].push(student);
+        }
+      });
+
+      setGroupedStudents(grouped);
     } catch (error) {
       console.error('Error fetching students:', error);
       message.error('Failed to load students');
@@ -151,15 +186,31 @@ const Students: React.FC = () => {
   // Handle form submission
   const handleSubmit = async (values: any) => {
     try {
+      let studentId;
+
       if (editingStudent) {
-        await axios.put(`/api/students/${editingStudent.id}`, values);
+        // For updates, send class_ids to handle enrollment changes
+        const studentData = {
+          ...values,
+          class_ids: selectedClasses
+        };
+        await axios.put(`/api/students/${editingStudent.id}`, studentData);
+        studentId = editingStudent.id;
         message.success('Student updated successfully');
       } else {
-        await axios.post('/api/students', values);
+        // For new students, send class_ids for initial enrollment
+        const studentData = {
+          ...values,
+          class_ids: selectedClasses
+        };
+        const response = await axios.post('/api/students', studentData);
+        studentId = response.data.data?.id;
         message.success('Student created successfully');
       }
+
       setModalVisible(false);
       setEditingStudent(null);
+      setSelectedClasses([]);
       form.resetFields();
       clearCache(); // Clear cache when data changes
       fetchStudents();
@@ -252,9 +303,9 @@ const Students: React.FC = () => {
   const columns: ColumnsType<Student> = [
     {
       title: 'Name',
-      dataIndex: 'name',
-      key: 'name',
-      sorter: (a, b) => a.name.localeCompare(b.name),
+      dataIndex: 'student_name',
+      key: 'student_name',
+      sorter: (a, b) => a.student_name.localeCompare(b.student_name),
       render: (name: string, record: Student) => (
         <Space direction="vertical" size={0}>
           <Text strong>{name}</Text>
@@ -280,6 +331,30 @@ const Students: React.FC = () => {
             </div>
           )}
         </Space>
+      ),
+    },
+    {
+      title: 'Classes',
+      key: 'classes',
+      render: (_, record: Student) => (
+        <div>
+          {record.enrolled_classes && record.enrolled_classes.length > 0 ? (
+            <div>
+              {record.enrolled_classes.slice(0, 2).map((enrollment) => (
+                <Tag key={enrollment.class_id} color="blue" style={{ marginBottom: '4px' }}>
+                  {enrollment.class_name}
+                </Tag>
+              ))}
+              {record.enrolled_classes.length > 2 && (
+                <div style={{ fontSize: '12px', color: '#666' }}>
+                  +{record.enrolled_classes.length - 2} more
+                </div>
+              )}
+            </div>
+          ) : (
+            <Text type="secondary">No classes</Text>
+          )}
+        </div>
       ),
     },
     {
@@ -339,6 +414,8 @@ const Students: React.FC = () => {
             onClick={() => {
               setEditingStudent(record);
               form.setFieldsValue(record);
+              // Set selected classes for editing
+              setSelectedClasses(record.enrolled_classes?.map(c => c.class_id) || []);
               setModalVisible(true);
             }}
           />
@@ -446,6 +523,7 @@ const Students: React.FC = () => {
             icon={<PlusOutlined />}
             onClick={() => {
               setEditingStudent(null);
+              setSelectedClasses([]);
               form.resetFields();
               setModalVisible(true);
             }}
@@ -455,20 +533,44 @@ const Students: React.FC = () => {
         </Col>
       </Row>
 
-      {/* Students Table */}
-      <Table
-        columns={columns}
-        dataSource={students}
-        loading={loading}
-        rowKey="id"
-        pagination={{
-          pageSize: 10,
-          showSizeChanger: true,
-          showQuickJumper: true,
-          showTotal: (total, range) => `${range[0]}-${range[1]} of ${total} students`,
-        }}
-        scroll={{ x: 800 }}
-      />
+      {/* Students Table - Grouped by Class */}
+      <div style={{ marginBottom: 16 }}>
+        <Text strong>Total Students: {students.length}</Text>
+      </div>
+
+      {Object.keys(groupedStudents).length > 0 && (
+        <div>
+          {Object.entries(groupedStudents).map(([className, classStudents], index) => (
+            <div key={className} style={{ marginBottom: index < Object.keys(groupedStudents).length - 1 ? 24 : 0 }}>
+              <div style={{
+                background: '#fafafa',
+                padding: '12px 16px',
+                borderLeft: '4px solid #1890ff',
+                marginBottom: 16,
+                borderRadius: '0 4px 4px 0'
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <Text strong style={{ fontSize: '16px' }}>
+                    {className}
+                  </Text>
+                  <Tag color="blue" style={{ fontSize: '14px', padding: '4px 12px' }}>
+                    {classStudents.length} students
+                  </Tag>
+                </div>
+              </div>
+              <Table
+                columns={columns}
+                dataSource={classStudents}
+                rowKey="id"
+                pagination={false}
+                size="small"
+                scroll={{ x: 800 }}
+                style={{ marginBottom: 0 }}
+              />
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Create/Edit Modal */}
       <Modal
@@ -477,6 +579,7 @@ const Students: React.FC = () => {
         onCancel={() => {
           setModalVisible(false);
           setEditingStudent(null);
+          setSelectedClasses([]);
           form.resetFields();
         }}
         footer={null}
@@ -530,6 +633,26 @@ const Students: React.FC = () => {
                 </Select>
               </Form.Item>
             </Col>
+            <Col span={12}>
+              <Form.Item
+                name="class_ids"
+                label="Enroll in Classes (Optional)"
+              >
+                <Select
+                  mode="multiple"
+                  placeholder="Select classes to enroll student in"
+                  style={{ width: '100%' }}
+                  value={selectedClasses}
+                  onChange={setSelectedClasses}
+                >
+                  {classes.map(cls => (
+                    <Option key={cls.id} value={cls.id}>
+                      {cls.name} - {cls.subject}
+                    </Option>
+                  ))}
+                </Select>
+              </Form.Item>
+            </Col>
           </Row>
 
           <Form.Item
@@ -563,7 +686,7 @@ const Students: React.FC = () => {
 
       {/* Enrollment Modal */}
       <Modal
-        title={`Enroll Student - ${selectedStudent?.name}`}
+        title={`Enroll Student - ${selectedStudent?.student_name}`}
         open={enrollmentModalVisible}
         onCancel={() => {
           setEnrollmentModalVisible(false);
@@ -618,7 +741,7 @@ const Students: React.FC = () => {
 
       {/* Balance Modal */}
       <Modal
-        title={`Class Balances - ${selectedStudent?.name}`}
+        title={`Class Balances - ${selectedStudent?.student_name}`}
         open={balanceModalVisible}
         onCancel={() => {
           setBalanceModalVisible(false);
@@ -664,7 +787,7 @@ const Students: React.FC = () => {
                       </Col>
                       <Col span={6}>
                         <Text type="secondary">Attended: </Text>
-                        <Text>{balance.classes_attended}</Text>
+                        <Text>{balance.classes_used}</Text>
                       </Col>
                     </Row>
                   }

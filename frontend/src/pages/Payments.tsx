@@ -37,7 +37,7 @@ interface Payment {
 
 interface Student {
   id: string;
-  name: string;
+  student_name: string;
   grade: string;
 }
 
@@ -500,7 +500,7 @@ const Payments: React.FC = () => {
             >
               {students.map(student => (
                 <Option key={student.id} value={student.id}>
-                  {student.name} - {student.grade || 'No Grade'}
+                  {student.student_name} - {student.grade || 'No Grade'}
                 </Option>
               ))}
             </Select>

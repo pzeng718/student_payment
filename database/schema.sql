@@ -206,32 +206,74 @@ CREATE TRIGGER update_payments_updated_at BEFORE UPDATE ON payments
 
 -- Views for common queries
 
--- Student balance view (classes purchased - classes attended)
+-- Student balance view (per-class balances)
 CREATE VIEW student_balances AS
 SELECT
     s.id as student_id,
     s.name as student_name,
     s.grade,
-    COALESCE(SUM(p.classes_purchased), 0) as total_classes_purchased,
-    COALESCE(SUM(p.classes_remaining), 0) as total_classes_remaining,
-    COALESCE(attended.classes_attended, 0) as classes_attended,
-    (COALESCE(SUM(p.classes_purchased), 0) - COALESCE(attended.classes_attended, 0)) as classes_used,
+    COALESCE(SUM(pca.classes_allocated), 0) as total_classes_purchased,
+    COALESCE(SUM(pca.classes_allocated - COALESCE(used.classes_used, 0)), 0) as total_classes_remaining,
+    COALESCE(SUM(used.classes_used), 0) as classes_attended,
+    COALESCE(SUM(used.classes_used), 0) as classes_used,
     CASE
-        WHEN COALESCE(SUM(p.classes_purchased), 0) > 0
+        WHEN COALESCE(SUM(pca.classes_allocated), 0) > 0
         THEN ROUND(
-            (COALESCE(attended.classes_attended, 0)::decimal /
-             COALESCE(SUM(p.classes_purchased), 0)::decimal) * 100, 2
+            (COALESCE(SUM(used.classes_used), 0)::decimal /
+             COALESCE(SUM(pca.classes_allocated), 0)::decimal) * 100, 2
         )
         ELSE 0
     END as attendance_percentage
 FROM students s
 LEFT JOIN payments p ON s.id = p.student_id
+LEFT JOIN payment_class_allocations pca ON p.id = pca.payment_id
 LEFT JOIN (
-    SELECT pd.student_id, SUM(pd.classes_deducted) as classes_attended
+    SELECT pd.student_id, pd.class_id, SUM(pd.classes_deducted) as classes_used
     FROM payment_deductions pd
-    GROUP BY pd.student_id
-) attended ON s.id = attended.student_id
-GROUP BY s.id, s.name, s.grade, attended.classes_attended;
+    GROUP BY pd.student_id, pd.class_id
+) used ON pca.class_id = used.class_id AND s.id = used.student_id
+GROUP BY s.id, s.name, s.grade;
+
+-- Per-class student balance view
+CREATE VIEW student_class_balances AS
+SELECT
+    s.id as student_id,
+    s.name as student_name,
+    c.id as class_id,
+    c.name as class_name,
+    c.subject,
+    COALESCE(alloc_summary.classes_allocated, 0) as classes_purchased,
+    COALESCE(alloc_summary.classes_allocated, 0) - COALESCE(deduction_summary.classes_deducted, 0) as classes_remaining,
+    COALESCE(deduction_summary.classes_deducted, 0) as classes_used,
+    CASE
+        WHEN COALESCE(alloc_summary.classes_allocated, 0) > 0
+        THEN ROUND(
+            (COALESCE(deduction_summary.classes_deducted, 0)::decimal /
+             COALESCE(alloc_summary.classes_allocated, 0)::decimal) * 100, 2
+        )
+        ELSE 0
+    END as attendance_percentage
+FROM students s
+JOIN student_class_enrollments sce ON s.id = sce.student_id AND sce.is_active = true
+JOIN classes c ON sce.class_id = c.id
+LEFT JOIN (
+    SELECT
+        p.student_id,
+        pca.class_id,
+        SUM(pca.classes_allocated) as classes_allocated
+    FROM payments p
+    JOIN payment_class_allocations pca ON p.id = pca.payment_id
+    GROUP BY p.student_id, pca.class_id
+) alloc_summary ON s.id = alloc_summary.student_id AND c.id = alloc_summary.class_id
+LEFT JOIN (
+    SELECT
+        pd.student_id,
+        pd.class_id,
+        SUM(pd.classes_deducted) as classes_deducted
+    FROM payment_deductions pd
+    GROUP BY pd.student_id, pd.class_id
+) deduction_summary ON s.id = deduction_summary.student_id AND c.id = deduction_summary.class_id
+ORDER BY c.name;
 
 -- Class enrollment summary view
 CREATE VIEW class_enrollment_summary AS
